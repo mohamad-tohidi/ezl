@@ -1,6 +1,6 @@
 [project]
-name = "ezetl"
-version = "0.1.0"
+name = "py-ezl"
+version = "0.2.1"
 description = "Easy ETL"
 readme = "README.md"
 authors = [
@@ -12,6 +12,14 @@ dependencies = [
     "tqdm>=4.67.1",
 ]
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/ezl"]
+
 [build-system]
-requires = ["uv_build>=0.9.8,<0.10.0"]
-build-backend = "uv_build"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "hatchling>=1.27.0",
+]
