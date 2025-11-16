@@ -1,7 +1,3 @@
-# this is a module for now
-# later it might become a library of its own
-
-
 import asyncio
 import janus
 import inspect
@@ -38,8 +34,13 @@ class Chan:
 
     # --- New Progress Bar Methods ---
 
-    def init_progress(self, position: int = 0) -> None:
-        """Initializes the tqdm progress bar for this channel to track fill level."""
+    def init_progress(
+        self, position: int = 0, colour: str = "blue"
+    ) -> None:
+        """
+        Initializes the tqdm progress bar for this channel to track fill level.
+        colour : str
+        """
         self._progress_bar = tqdm(
             total=self.maxsize
             if self.maxsize > 0
@@ -47,6 +48,7 @@ class Chan:
             desc=f"{self.name} fill:",
             unit="item",
             position=position,
+            colour=colour,
             leave=True,
             dynamic_ncols=True,
         )
