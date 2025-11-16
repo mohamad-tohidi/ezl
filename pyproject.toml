@@ -1,5 +1,5 @@
 [project]
-name = "ezl"
+name = "ezetl"
 version = "0.1.0"
 description = "Easy ETL"
 readme = "README.md"
