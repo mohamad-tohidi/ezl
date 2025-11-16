@@ -34,7 +34,7 @@ class Chan:
 
     # --- New Progress Bar Methods ---
 
-    def init_progress(
+    def init_buffers_tqdm(
         self, position: int = 0, colour: str = "blue"
     ) -> None:
         """
