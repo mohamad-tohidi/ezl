@@ -1,2 +1,3 @@
-def hello() -> str:
-    return "Hello from ezl!"
+from .go import go, chan, Chan
+
+__all__ = ["go", "chan", "Chan"]
