@@ -1,3 +1,3 @@
-from .go import go, chan, Chan, run
+from .go import run, task
 
-__all__ = ["go", "chan", "Chan", "run"]
+__all__ = ["run", "task"]
