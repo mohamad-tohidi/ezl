@@ -12,7 +12,7 @@ async def extract():
     """Extract: Pull data from source"""
     print("🔍 Extracting 50 documents...")
     for i in range(50):
-        await asyncio.sleep(0.05)  # Simulate I/O
+        await asyncio.sleep(0.05)
         yield {
             "id": f"doc_{i}",
             "text": f"Sample document {i}",
@@ -37,9 +37,7 @@ async def transform(item):
 async def load(item):
     """Load: Insert into target"""
     await asyncio.sleep(0.05)  # Simulate I/O
-    print(
-        f"💾 Loaded: {item['id']}"
-    )  # In real code: await db.insert(item)
+    # print(f"💾 Loaded: {item['id']}")
 
 
 # ========================================
