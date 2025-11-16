@@ -1,7 +1,7 @@
 [project]
 name = "ezl"
 version = "0.1.0"
-description = "Add your description here"
+description = "Easy ETL"
 readme = "README.md"
 authors = [
     { name = "mohamad-tohidi", email = "the.mohammad.tohidi@gmail.com" }
