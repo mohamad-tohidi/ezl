@@ -4,9 +4,6 @@ import inspect
 from typing import Callable, Any, TypeVar
 from queue import Empty
 
-from tqdm.asyncio import tqdm
-
-
 T = TypeVar("T")
 
 
@@ -23,7 +20,6 @@ class Chan:
         self._q: janus.Queue = janus.Queue(maxsize=maxsize)
         self._is_closed: bool = False
         self.name = name
-        self._progress_bar: tqdm | None = None
         self.maxsize = maxsize
 
         # Aliases (send/asend point to the overridden put methods)
@@ -32,21 +28,6 @@ class Chan:
         self.asend = self.async_put
         self.arecv = self.async_get
 
-    # --- New Progress Bar Methods ---
-
-    def init_progress(self, position: int = 0) -> None:
-        """Initializes the tqdm progress bar for this channel to track fill level."""
-        self._progress_bar = tqdm(
-            total=self.maxsize
-            if self.maxsize > 0
-            else None,
-            desc=f"{self.name} fill:",
-            unit="item",
-            position=position,
-            leave=True,
-            dynamic_ncols=True,
-        )
-
     def sync_put(self, item: T):
         """Puts an item synchronously and updates the progress bar."""
         if self._is_closed:
@@ -54,8 +35,6 @@ class Chan:
                 "Cannot send on closed channel"
             )
         self._q.sync_q.put(item)
-        if self._progress_bar is not None:
-            self._progress_bar.update(1)
 
     async def async_put(self, item: T):
         """Puts an item asynchronously and updates the progress bar."""
@@ -64,16 +43,12 @@ class Chan:
                 "Cannot send on closed channel"
             )
         await self._q.async_q.put(item)
-        if self._progress_bar is not None:
-            self._progress_bar.update(1)
 
     def sync_get(self) -> T:
         """Gets an item synchronously, updating the progress bar, and handling close."""
         while True:
             try:
                 item = self._q.sync_q.get(timeout=0.1)
-                if self._progress_bar is not None:
-                    self._progress_bar.update(-1)
                 self._q.sync_q.task_done()
                 return item
             except Empty:
@@ -87,8 +62,6 @@ class Chan:
                 item = await asyncio.wait_for(
                     self._q.async_q.get(), timeout=0.1
                 )
-                if self._progress_bar is not None:
-                    self._progress_bar.update(-1)
                 self._q.async_q.task_done()
                 return item
             except asyncio.TimeoutError:
