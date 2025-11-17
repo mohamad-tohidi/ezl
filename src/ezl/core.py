@@ -179,7 +179,6 @@ async def _run_async(stages: list[Stage]):
         "[bold green]Total processed", total=None
     )
 
-    # create a progress task for every buffer (output_chan of every non-sink stage)
     for i, stage in enumerate(stages[:-1]):
         ch = stage.output_chan
         next_stage = stages[i + 1]
@@ -187,9 +186,8 @@ async def _run_async(stages: list[Stage]):
         task_id = progress.add_task(
             desc, total=ch.maxsize or None, completed=0
         )
-        ch.task_id = task_id  # monkey-patch
+        ch.task_id = task_id
 
-    # one list of tasks per stage
     worker_tasks_per_stage: list[list[asyncio.Task]] = []
     for stage in stages:
         stage_tasks = [
@@ -211,6 +209,7 @@ async def _run_async(stages: list[Stage]):
             progress,
             title="🚀 Live EZL TUI",
             border_style="bright_blue",
+            expand=False,
         ),
         refresh_per_second=10,
     ):
