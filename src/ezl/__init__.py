@@ -1,3 +1,3 @@
-# from .go import run, task
+from .core import task, run
 
-# __all__ = ["run", "task"]
+__all__ = ["task", "run"]
