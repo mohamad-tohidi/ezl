@@ -242,13 +242,84 @@ async def _run_async(stages: list[Stage]):
                 t.cancel()
 
 
-def run():
+def run(setup_callback=None, teardown_callback=None):
+    """
+    Execute the defined ETL pipeline.
+
+    This function runs the pipeline stages connected via the chaining
+    operator (>>). It validates that a pipeline has been defined, logs
+    the pipeline structure, and executes the stages asynchronously using
+    asyncio.
+
+    Args:
+        setup_callback (callable, optional): An optional async callable
+            invoked at the start of the pipeline execution, before stages
+            run. Use this to initialize shared resources (e.g., database
+            pools, API clients) that tasks rely on via globals or closures.
+            It should be an async function (def async def setup(): ...).
+            Defaults to None (no setup performed).
+        teardown_callback (callable, optional): An optional async callable
+            invoked at the end of the pipeline execution (in a finally block),
+            after stages complete or if an error occurs. Use this to clean up
+            resources initialized in setup_callback (e.g., close connections,
+            release locks). It should be an async function (def async def teardown(): ...).
+            Defaults to None (no teardown performed).
+
+    Raises:
+        RuntimeError: If no pipeline is defined (i.e., no stages chained).
+
+    Returns:
+        None
+
+    Examples:
+        >>> # Basic usage: No callbacks (original behavior)
+        >>> from ezl import src, transform, load
+        >>> @src
+        >>> async def extract(): yield {"data": 1}
+        >>> @transform
+        >>> async def process(item): yield {"processed": item["data"]}
+        >>> @load
+        >>> async def sink(item): print(item)
+        >>> extract >> process >> sink
+        >>> run()  # Runs pipeline without setup/teardown
+
+        >>> # With callbacks: Initialize Elasticsearch client
+        >>> from elasticsearch import AsyncElasticsearch
+        >>> async def setup_es():
+        ...     global es
+        ...     es = AsyncElasticsearch(hosts=["http://localhost:9200"])
+        >>> async def teardown_es():
+        ...     global es
+        ...     await es.close()
+        >>> # ... define stages using 'es' (e.g., in extract)
+        >>> run(setup_callback=setup_es, teardown_callback=teardown_es)
+
+        >>> # With callbacks: Database pool for asyncpg
+        >>> import asyncpg
+        >>> DB_CONFIG = {"host": "localhost", "database": "mydb", ...}
+        >>> async def setup_db():
+        ...     global db_pool
+        ...     db_pool = await asyncpg.create_pool(**DB_CONFIG, min_size=1, max_size=10)
+        >>> async def teardown_db():
+        ...     global db_pool
+        ...     if db_pool: await db_pool.close()
+        >>> # ... define stages using 'db_pool' (e.g., acquire in extract)
+        >>> run(setup_callback=setup_db, teardown_callback=teardown_db)
+
+    Notes:
+        - Callbacks are executed within the same event loop as the pipeline,
+          ensuring proper async context for resources like AsyncElasticsearch
+          or asyncpg pools.
+        - Globals (e.g., 'es', 'db_pool') are commonly used for shared state,
+          but consider dependency injection via closures for more robust designs.
+        - Errors in setup_callback will prevent pipeline execution; errors in
+          teardown_callback are logged but do not affect the pipeline result.
+    """
     global _current_sink
     if _current_sink is None:
         raise RuntimeError(
             "No pipeline defined — use src >> transform >> load first"
         )
-
     stages = get_stages(_current_sink)
     logger.info("═" * 60)
     logger.info(
@@ -256,9 +327,17 @@ def run():
     )
     logger.info("═" * 60)
 
-    asyncio.run(_run_async(stages))
-    _current_sink = None
+    async def wrapped_run():
+        if setup_callback:
+            await setup_callback()  # e.g., init globals like es = AsyncElasticsearch(...)
+        try:
+            await _run_async(stages)
+        finally:
+            if teardown_callback:
+                await teardown_callback()  # e.g., await es.close()
+        _current_sink = None
 
+    asyncio.run(wrapped_run())
 
 def task(
     *,
