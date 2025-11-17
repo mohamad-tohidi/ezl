@@ -1,10 +1,6 @@
-from ezl import task, run
+from src.ezl.core import task, run
 import asyncio
 import random
-
-# ========================================
-# 1. DEFINE YOUR TASKS
-# ========================================
 
 
 @task(buffer=100, workers=1)
@@ -36,8 +32,7 @@ async def transform(item):
 @task(buffer=50, workers=2)
 async def load(item):
     """Load: Insert into target"""
-    await asyncio.sleep(0.05)  # Simulate I/O
-    # print(f"💾 Loaded: {item['id']}")
+    await asyncio.sleep(0.05)
 
 
 # ========================================
@@ -53,4 +48,4 @@ pipeline = extract >> transform >> load
 if __name__ == "__main__":
     print("🚀 ETL Pipeline Starting...")
     print("=" * 50)
-    run()  # Auto-detects pipeline & shows progress bars
+    run()

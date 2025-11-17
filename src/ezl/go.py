@@ -1,299 +1,157 @@
 import asyncio
 import janus
 import inspect
-from typing import Callable, Any, TypeVar, List, Optional
+from typing import Callable, Any, TypeVar
+from queue import Empty
+
 from tqdm.asyncio import tqdm
+
 
 T = TypeVar("T")
 
 
 class Chan:
-    """Hybrid channel with both sync/async interfaces, backed by janus.Queue."""
+    """
+    A wrapper around janus.Queue to mimic a Go Channel,
+    now supporting synchronous iteration and tqdm progress tracking on puts and gets to show fill level.
+    """
 
     def __init__(
-        self,
-        maxsize: int = 0,
-        name: str = "Channel",
-        position: int = 0,
+        self, maxsize: int = 0, name: str = "Channel"
     ):
-        self._q = janus.Queue(maxsize=maxsize or 0)
-        self._closed = False
+        # janus.Queue handles the concurrent access.
+        self._q: janus.Queue = janus.Queue(maxsize=maxsize)
+        self._is_closed: bool = False
         self.name = name
+        self._progress_bar: tqdm | None = None
+        self.maxsize = maxsize
 
-        # Progress bar for buffered channels
-        self._progress: Optional[tqdm] = None
-        if maxsize > 0:
-            self._progress = tqdm(
-                total=maxsize,
-                desc=f"{self.name} fill:",
-                unit="item",
-                position=position,
-                colour="blue",
-                leave=True,
-                dynamic_ncols=True,
-            )
+        # Aliases (send/asend point to the overridden put methods)
+        self.send = self.sync_put
+        self.recv = self.sync_get
+        self.asend = self.async_put
+        self.arecv = self.async_get
 
-    # === Async Interface (used by pipeline workers) ===
-    async def put(self, item: T) -> None:
-        """Put item asynchronously."""
-        if self._closed:
+    # --- New Progress Bar Methods ---
+
+    def init_progress(self, position: int = 0) -> None:
+        """Initializes the tqdm progress bar for this channel to track fill level."""
+        self._progress_bar = tqdm(
+            total=self.maxsize
+            if self.maxsize > 0
+            else None,
+            desc=f"{self.name} fill:",
+            unit="item",
+            position=position,
+            leave=True,
+            dynamic_ncols=True,
+        )
+
+    def sync_put(self, item: T):
+        """Puts an item synchronously and updates the progress bar."""
+        if self._is_closed:
             raise ValueError(
-                f"Cannot send on closed channel: {self.name}"
-            )
-        await self._q.async_q.put(item)
-        if self._progress:
-            self._progress.update(1)
-
-    async def get(self) -> T:
-        """Get item asynchronously."""
-        item = await self._q.async_q.get()
-        self._q.async_q.task_done()
-        if self._progress:
-            self._progress.update(-1)
-        return item
-
-    # === Sync Interface (for direct user access) ===
-    def sync_put(self, item: T) -> None:
-        """Put item synchronously."""
-        if self._closed:
-            raise ValueError(
-                f"Cannot send on closed channel: {self.name}"
+                "Cannot send on closed channel"
             )
         self._q.sync_q.put(item)
-        if self._progress:
-            self._progress.update(1)
+        if self._progress_bar is not None:
+            self._progress_bar.update(1)
+
+    async def async_put(self, item: T):
+        """Puts an item asynchronously and updates the progress bar."""
+        if self._is_closed:
+            raise ValueError(
+                "Cannot send on closed channel"
+            )
+        await self._q.async_q.put(item)
+        if self._progress_bar is not None:
+            self._progress_bar.update(1)
 
     def sync_get(self) -> T:
-        """Get item synchronously."""
-        item = self._q.sync_q.get()
-        self._q.sync_q.task_done()
-        if self._progress:
-            self._progress.update(-1)
-        return item
+        """Gets an item synchronously, updating the progress bar, and handling close."""
+        while True:
+            try:
+                item = self._q.sync_q.get(timeout=0.1)
+                if self._progress_bar is not None:
+                    self._progress_bar.update(-1)
+                self._q.sync_q.task_done()
+                return item
+            except Empty:
+                if self._is_closed:
+                    raise StopIteration
 
-    # === Aliases ===
-    send = sync_put
-    recv = sync_get
-    asend = put
-    arecv = get
+    async def async_get(self) -> T:
+        """Gets an item asynchronously, updating the progress bar, and handling close."""
+        while True:
+            try:
+                item = await asyncio.wait_for(
+                    self._q.async_q.get(), timeout=0.1
+                )
+                if self._progress_bar is not None:
+                    self._progress_bar.update(-1)
+                self._q.async_q.task_done()
+                return item
+            except asyncio.TimeoutError:
+                if self._is_closed:
+                    raise StopAsyncIteration
 
-    # === Lifecycle & Iteration ===
+    # --- Overridden Close Method to Finalize Progress Bar ---
+
     def close(self) -> None:
-        """Close the channel."""
-        if not self._closed:
-            self._closed = True
+        """
+        Marks the channel as closed. Progress bar remains open to allow draining remaining items.
+        """
+        if not self._is_closed:
+            self._is_closed = True
             print(f"[Chan] {self.name} closed.")
 
+    # --- ASYNCHRONOUS ITERATION METHODS ---
     def __aiter__(self):
-        """Enable async for loops."""
+        """Returns the async iterator object."""
         return self
 
-    async def __anext__(self) -> T:
-        """Async iterator protocol."""
-        if self._closed and self._q.async_q.empty():
-            raise StopAsyncIteration
-        return await self.get()
+    async def __anext__(self) -> Any:
+        """Gets the next item asynchronously, raising StopAsyncIteration on close/empty."""
+        return await self.async_get()
+
+    # --- Synchronous Iteration Methods ---
+
+    def __iter__(self) -> "Chan":
+        return self
+
+    def __next__(self) -> Any:
+        """Gets the next item synchronously, raising StopIteration on close/empty."""
+        return self.sync_get()
+
+    def __str__(self):
+        # We need to use .qsize() for the janus queue size
+        return f"<Chan size={self._q.qsize()} closed={self._is_closed}>"
 
 
-def chan(
-    maxsize: int = 0,
-    name: str = "Channel",
-    position: int = 0,
-) -> Chan:
-    return Chan(
-        maxsize=maxsize, name=name, position=position
-    )
+def chan(maxsize: int = 0, name: str = "Channel") -> Chan:
+    """Creates a new channel."""
+    return Chan(maxsize, name)
 
 
-async def call_user_func(func: Callable, *args) -> Any:
-    """Execute sync/async functions transparently."""
+def go(
+    func: Callable[..., Any], *args: Any, **kwargs: Any
+) -> asyncio.Task:
+    """Fires and forgets a function, handling both sync and async callable types."""
+    loop = asyncio.get_event_loop()
+
     if inspect.iscoroutinefunction(func):
-        return await func(*args)
-    return await asyncio.to_thread(func, *args)
-
-
-async def process_results(
-    result: Any, out_ch: Optional[Chan]
-) -> None:
-    """Handle single values, generators, and async generators."""
-    if not out_ch:
-        return
-
-    if inspect.isgenerator(result):
-        # Sync generator → thread pool
-        loop = asyncio.get_event_loop()
-
-        def iterate():
-            for item in result:
-                asyncio.run_coroutine_threadsafe(
-                    out_ch.put(item), loop
-                )
-
-        await asyncio.to_thread(iterate)
-    elif inspect.isasyncgen(result):
-        async for item in result:
-            await out_ch.put(item)
+        coro = func(*args, **kwargs)
     else:
-        # Single value
-        await out_ch.put(result)
+        # Run sync functions in a separate thread
+        coro = asyncio.to_thread(func, *args, **kwargs)
+
+    task = loop.create_task(coro)
+    return task
 
 
-async def run_worker(
-    func: Callable,
-    in_ch: Optional[Chan],
-    out_ch: Optional[Chan],
-    name: str,
-    role: str,
-) -> None:
-    """Unified worker for all task types."""
+def run(main_coroutine: Callable[..., Any]) -> None:
+    """The main entry point, analogous to main() in Go."""
     try:
-        if role == "producer":
-            result = await call_user_func(func)
-            await process_results(result, out_ch)
-        elif role == "consumer":
-            async for item in in_ch:
-                await call_user_func(func, item)
-        else:  # transformer
-            async for item in in_ch:
-                result = await call_user_func(func, item)
-                await process_results(result, out_ch)
-    except Exception as e:
-        print(f"[{name}] Error: {e}")
-        raise
-
-
-class Task:
-    """ETL task with auto-detected role."""
-
-    def __init__(
-        self,
-        func: Callable,
-        buffer: int = 0,
-        workers: int = 1,
-    ):
-        self.func = func
-        self.buffer = buffer
-        self.workers = workers
-        self.name = func.__name__
-
-        sig = inspect.signature(func)
-        has_params = bool(sig.parameters)
-        is_gen = inspect.isgeneratorfunction(
-            func
-        ) or inspect.isasyncgenfunction(func)
-
-        if is_gen and not has_params:
-            self.role = "producer"
-        elif is_gen and has_params:
-            self.role = "transformer"
-        elif not is_gen and has_params:
-            self.role = "consumer"
-        else:
-            raise ValueError(
-                f"Task '{self.name}' must be producer, transformer, or consumer"
-            )
-
-    def __rshift__(self, other: "Task") -> "Pipeline":
-        return Pipeline([self, other])
-
-    def __call__(self, *args, **kwargs):
-        return self.func(*args, **kwargs)
-
-    def create_channel(self, position: int = 0) -> Chan:
-        return chan(
-            maxsize=self.buffer,
-            name=self.name,
-            position=position,
-        )
-
-
-class Pipeline:
-    """Chain of tasks with auto-wired channels."""
-
-    def __init__(self, tasks: List[Task]):
-        self.tasks = tasks
-
-    def __rshift__(self, task: Task) -> "Pipeline":
-        return Pipeline(self.tasks + [task])
-
-    def run(self) -> None:
-        if not self.tasks:
-            print("No tasks to run.")
-            return
-
-        print(
-            f"\n🚀 Starting pipeline with {len(self.tasks)} tasks..."
-        )
-
-        # Create channels (with positioned progress bars)
-        channels = [
-            task.create_channel(position=i)
-            for i, task in enumerate(self.tasks[:-1])
-        ]
-
-        # Build worker tasks
-        workers = []
-        for i, task in enumerate(self.tasks):
-            in_ch = channels[i - 1] if i > 0 else None
-            out_ch = (
-                channels[i] if i < len(channels) else None
-            )
-
-            for wid in range(task.workers):
-                name = (
-                    f"{task.name}-{wid}"
-                    if task.workers > 1
-                    else task.name
-                )
-                workers.append(
-                    run_worker(
-                        task.func,
-                        in_ch,
-                        out_ch,
-                        name,
-                        task.role,
-                    )
-                )
-
-        # Run and cleanup
-        asyncio.run(self._execute(workers, channels))
-
-    async def _execute(
-        self,
-        workers: List[asyncio.Task],
-        channels: List[Chan],
-    ) -> None:
-        await asyncio.gather(
-            *workers, return_exceptions=True
-        )
-        for ch in channels:
-            ch.close()
-
-
-def task(
-    buffer: int = 0, workers: int = 1
-) -> Callable[[Callable], Task]:
-    def decorator(func: Callable) -> Task:
-        return Task(func, buffer=buffer, workers=workers)
-
-    return decorator
-
-
-def run(main: Callable = None) -> None:
-    """Main entry point with auto-detection."""
-    if main is not None:
-        asyncio.run(main())
-        return
-
-    import __main__
-
-    for obj in vars(__main__).values():
-        if isinstance(obj, Pipeline):
-            obj.run()
-            return
-
-    raise RuntimeError(
-        "No pipeline found. Either:\n"
-        "  1. Call run(my_async_function)\n"
-        "  2. Define tasks with @task and chain with >>"
-    )
+        asyncio.run(main_coroutine())
+    except KeyboardInterrupt:
+        print("\nProgram terminated.")
