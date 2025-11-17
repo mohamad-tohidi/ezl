@@ -1,10 +1,10 @@
-from src.ezl.core import task, run
+from ezl import task, run
 import asyncio
 import random
 
 
-@task(buffer=100, workers=1)
-async def extract():
+@task(buffer=100, workers=10)
+async def somthing_else():
     """Extract: Pull data from source"""
     print("🔍 Extracting 50 documents...")
     for i in range(50):
@@ -39,7 +39,7 @@ async def load(item):
 # 2. BUILD PIPELINE
 # ========================================
 
-pipeline = extract >> transform >> load
+pipeline = somthing_else >> transform >> load
 
 # ========================================
 # 3. RUN

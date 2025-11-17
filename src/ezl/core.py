@@ -1,5 +1,3 @@
-# pipeline.py - Rich TUI + topology line with worker fan-out highlight + orderly shutdown
-
 import asyncio
 import inspect
 import logging
@@ -13,10 +11,7 @@ from rich.progress import (
 )
 from rich.live import Live
 from rich.panel import Panel
-from rich.text import Text
-from rich.console import Group
 from rich.logging import RichHandler
-from rich import box
 
 from .go import chan, Chan
 
@@ -80,7 +75,7 @@ class Stage:
 
 
 # ------------------------------------------------------------------
-# Worker
+# Worker - updates Rich progress bars
 # ------------------------------------------------------------------
 async def _stage_worker(
     stage: Stage,
@@ -105,17 +100,21 @@ async def _stage_worker(
                             stage.output_chan.task_id,
                             advance=1,
                         )
+
+                    # if the source is also the sink (single-stage pipeline)
                     if stage is sink_stage:
                         progress.update(
                             overall_task, advance=1
                         )
         else:
             async for item in stage.input_chan:
+                # drain buffer bar
                 if hasattr(stage.input_chan, "task_id"):
                     progress.update(
                         stage.input_chan.task_id, advance=-1
                     )
 
+                # count as processed when the sink receives the item
                 if stage is sink_stage:
                     progress.update(overall_task, advance=1)
 
@@ -137,7 +136,9 @@ async def _stage_worker(
                                     advance=1,
                                 )
                 else:
-                    await result
+                    await (
+                        result
+                    )  # plain async sink (e.g. load)
 
         logger.info(f"{tag} Completed")
 
@@ -178,12 +179,8 @@ async def _run_async(stages: list[Stage]):
         "[bold green]Total processed", total=None
     )
 
-    sink_stage = stages[-1]
-
-    # Buffer progress tasks
-    for i, stage in enumerate(
-        stages[:-1]
-    ):  # all but last stage
+    # create a progress task for every buffer (output_chan of every non-sink stage)
+    for i, stage in enumerate(stages[:-1]):
         ch = stage.output_chan
         next_stage = stages[i + 1]
         desc = f"{stage.name} (w{stage.workers}) → {next_stage.name} buffer"
@@ -192,66 +189,31 @@ async def _run_async(stages: list[Stage]):
         )
         ch.task_id = task_id  # monkey-patch
 
-    # Topology line (static)
-    topology = Text(
-        "Pipeline Topology:", style="bold bright_white"
-    )
-    for i, stage in enumerate(stages):
-        if i > 0:
-            buffer_size = stages[i - 1].buffer
-            buffer_str = (
-                "∞"
-                if buffer_size == 0
-                else str(buffer_size)
+    # one list of tasks per stage
+    worker_tasks_per_stage: list[list[asyncio.Task]] = []
+    for stage in stages:
+        stage_tasks = [
+            asyncio.create_task(
+                _stage_worker(
+                    stage,
+                    i,
+                    progress=progress,
+                    overall_task=overall_task,
+                    sink_stage=stages[-1],
+                )
             )
-            topology.append(
-                f" ──► [buffer {buffer_str}] ──► ",
-                style="yellow",
-            )
-        topology.append(
-            f" [{stage.name} ×", style="bold cyan"
-        )
-        topology.append(
-            f"{stage.workers}",
-            style="bold magenta"
-            if stage.workers > 1
-            else "bold green",
-        )
-        topology.append(" workers]", style="bold cyan")
-
-    topology_panel = Panel(
-        topology,
-        title=" Topology ",
-        border_style="bright_cyan",
-        box=box.ROUNDED,
-    )
-
-    group = Group(topology_panel, progress)
+            for i in range(stage.workers)
+        ]
+        worker_tasks_per_stage.append(stage_tasks)
 
     with Live(
         Panel(
-            group,
-            title=" 🚀 Live Pipeline Dashboard ",
+            progress,
+            title="🚀 Live EZL TUI",
             border_style="bright_blue",
         ),
         refresh_per_second=10,
     ):
-        worker_tasks_per_stage = []
-        for stage in stages:
-            stage_tasks = [
-                asyncio.create_task(
-                    _stage_worker(
-                        stage,
-                        i,
-                        progress=progress,
-                        overall_task=overall_task,
-                        sink_stage=sink_stage,
-                    )
-                )
-                for i in range(stage.workers)
-            ]
-            worker_tasks_per_stage.append(stage_tasks)
-
         try:
             for i, stage in enumerate(stages):
                 await asyncio.gather(
@@ -285,7 +247,7 @@ def run():
     global _current_sink
     if _current_sink is None:
         raise RuntimeError(
-            "No pipeline defined — use extract >> transform >> load"
+            "No pipeline defined — use src >> transform >> load first"
         )
 
     stages = get_stages(_current_sink)
