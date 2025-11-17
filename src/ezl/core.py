@@ -1,44 +1,43 @@
-# pipeline.py - Enhanced with structured, tagged logging for full observability
+# pipeline.py - Rich TUI + orderly shutdown + clean close
 
 import asyncio
 import inspect
 import logging
+from rich.progress import (
+    Progress,
+    BarColumn,
+    TextColumn,
+    TransferSpeedColumn,
+    TimeRemainingColumn,
+    MofNCompleteColumn,
+)
+from rich.live import Live
+from rich.panel import Panel
+from rich.logging import RichHandler
+
 from .go import chan, Chan
 
 # ------------------------------------------------------------------
-# Logging setup - clean, tagged, colored-optional, no duplicate handlers
+# Logging
 # ------------------------------------------------------------------
 logger = logging.getLogger("ezl")
-if not logger.handlers:
-    logger.setLevel(
-        logging.INFO
-    )  # Change to DEBUG globally if you want per-item logs later
-
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)-8s | %(message)s",
-        datefmt="%H:%M:%S",
+logger.handlers.clear()
+logger.setLevel(logging.INFO)
+logger.addHandler(
+    RichHandler(
+        show_time=True,
+        show_path=False,
+        markup=True,
+        rich_tracebacks=True,
     )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+)
 
 # ------------------------------------------------------------------
-# Globals for the DSL
+# Stage & task
 # ------------------------------------------------------------------
 _current_sink: "Stage | None" = None
-_next_position = 0
 
 
-def _get_next_position() -> int:
-    global _next_position
-    pos = _next_position
-    _next_position += 1
-    return pos
-
-
-# ------------------------------------------------------------------
-# Stage & task decorator
-# ------------------------------------------------------------------
 class Stage:
     def __init__(
         self,
@@ -62,149 +61,211 @@ class Stage:
     def __rshift__(self, other: "Stage") -> "Stage":
         if not isinstance(other, Stage):
             raise TypeError(
-                "Only @task-decorated functions can be chained with >>"
+                "Only @task stages can be chained with >>"
             )
 
         ch = chan(
             maxsize=self.buffer,
-            name=f"{self.name} → {other.name}",
+            name=f"{self.name}→{other.name}",
         )
-        ch.init_progress(position=_get_next_position())
-
         self.output_chan = ch
         other.input_chan = ch
         other.prev = self
-
         global _current_sink
         _current_sink = other
         return other
 
 
 # ------------------------------------------------------------------
-# Worker - now with detailed per-worker logging and counters
+# Worker - updates Rich progress bars
 # ------------------------------------------------------------------
-async def _stage_worker(stage: Stage, worker_id: int):
+async def _stage_worker(
+    stage: Stage,
+    worker_id: int,
+    *,
+    progress: Progress,
+    overall_task: int,
+    sink_stage: Stage,
+):
     tag = f"[{stage.name} w{worker_id:02d}]"
-    received = produced = 0
-
     try:
         logger.info(f"{tag} Starting")
 
         if stage.is_source:
             async for item in stage.func():
-                produced += 1
                 if stage.output_chan:
                     await stage.output_chan.async_put(item)
+                    if hasattr(
+                        stage.output_chan, "task_id"
+                    ):
+                        progress.update(
+                            stage.output_chan.task_id,
+                            advance=1,
+                        )
+
+                    # if the source is also the sink (single-stage pipeline)
+                    if stage is sink_stage:
+                        progress.update(
+                            overall_task, advance=1
+                        )
         else:
             async for item in stage.input_chan:
-                received += 1
+                # drain buffer bar
+                if hasattr(stage.input_chan, "task_id"):
+                    progress.update(
+                        stage.input_chan.task_id, advance=-1
+                    )
+
+                # count as processed when the sink receives the item
+                if stage is sink_stage:
+                    progress.update(overall_task, advance=1)
+
                 result = stage.func(item)
 
                 if inspect.isasyncgen(result):
                     async for out_item in result:
-                        produced += 1
                         if stage.output_chan:
                             await (
                                 stage.output_chan.async_put(
                                     out_item
                                 )
                             )
-                else:  # sink
-                    await result
+                            if hasattr(
+                                stage.output_chan, "task_id"
+                            ):
+                                progress.update(
+                                    stage.output_chan.task_id,
+                                    advance=1,
+                                )
+                else:
+                    await (
+                        result
+                    )  # plain async sink (e.g. load)
 
-        logger.info(
-            f"{tag} Completed │ Received: {received:,} │ Produced: {produced:,}"
-        )
+        logger.info(f"{tag} Completed")
 
     except asyncio.CancelledError:
-        logger.debug(
-            f"{tag} Cancelled (normal during shutdown)"
-        )
         return
     except Exception:
-        logger.exception(
-            f"{tag} FAILED │ Received: {received:,} │ Produced: {produced:,}"
-        )
+        logger.exception(f"{tag} FAILED")
         raise
 
 
 # ------------------------------------------------------------------
-# Pipeline construction helpers
+# Run
 # ------------------------------------------------------------------
 def get_stages(sink: Stage) -> list[Stage]:
     stages = []
-    current = sink
-    while current is not None:
-        stages.append(current)
-        current = current.prev
+    cur = sink
+    while cur:
+        stages.append(cur)
+        cur = cur.prev
     stages.reverse()
     return stages
 
 
-# ------------------------------------------------------------------
-# Run - all stages run concurrently, orderly shutdown with channel closing
-# ------------------------------------------------------------------
 async def _run_async(stages: list[Stage]):
-    logger.info("═" * 60)
-    logger.info(
-        f"Pipeline STARTING │ Stages: {' → '.join(s.name for s in stages)}"
-    )
-    logger.info("═" * 60)
+    if not stages:
+        return
 
-    # Create all worker tasks upfront (they start running immediately)
+    progress = Progress(
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        expand=True,
+    )
+
+    overall_task = progress.add_task(
+        "[bold green]Total processed", total=None
+    )
+
+    # create a progress task for every buffer (output_chan of every non-sink stage)
+    for i, stage in enumerate(stages[:-1]):
+        ch = stage.output_chan
+        next_stage = stages[i + 1]
+        desc = f"{stage.name} (w{stage.workers}) → {next_stage.name} buffer"
+        task_id = progress.add_task(
+            desc, total=ch.maxsize or None, completed=0
+        )
+        ch.task_id = task_id  # monkey-patch
+
+    # one list of tasks per stage
     worker_tasks_per_stage: list[list[asyncio.Task]] = []
     for stage in stages:
         stage_tasks = [
-            asyncio.create_task(_stage_worker(stage, i))
+            asyncio.create_task(
+                _stage_worker(
+                    stage,
+                    i,
+                    progress=progress,
+                    overall_task=overall_task,
+                    sink_stage=stages[-1],
+                )
+            )
             for i in range(stage.workers)
         ]
         worker_tasks_per_stage.append(stage_tasks)
 
-    try:
-        # Wait for each stage in order and close its output channel
-        for i, stage in enumerate(stages):
-            if stage.workers > 0:
+    with Live(
+        Panel(
+            progress,
+            title=" 🚀 Live Pipeline Dashboard ",
+            border_style="bright_blue",
+        ),
+        refresh_per_second=10,
+    ) as live:
+        try:
+            for i, stage in enumerate(stages):
                 await asyncio.gather(
-                    *worker_tasks_per_stage[i],
-                    return_exceptions=False,
-                )
+                    *worker_tasks_per_stage[i]
+                )  # wait for this stage to finish
+                if (
+                    ch := stage.output_chan
+                ):  # <-- clean version
+                    ch.close()
+                    logger.info(
+                        f"Closed channel │ {ch.name}"
+                    )
 
-            if stage.output_chan:
-                stage.output_chan.close()
-                logger.info(
-                    f"Closed channel │ {stage.output_chan.name}"
-                )
+            logger.info(
+                "Pipeline finished — all items processed"
+            )
 
-        logger.info("Pipeline completed successfully")
-
-    finally:
-        # Safety net - cancel everything still running
-        all_tasks = [
-            t for sub in worker_tasks_per_stage for t in sub
-        ]
-        for t in all_tasks:
-            if not t.done():
+        except Exception:
+            logger.exception("Pipeline failed")
+            raise
+        finally:
+            # cancel any tasks that are still running (should only happen on error)
+            remaining = [
+                t
+                for sub in worker_tasks_per_stage
+                for t in sub
+                if not t.done()
+            ]
+            for t in remaining:
                 t.cancel()
 
 
 def run():
-    global _current_sink, _next_position
+    global _current_sink
     if _current_sink is None:
         raise RuntimeError(
-            "No pipeline defined. Use extract >> transform >> load first."
+            "No pipeline defined — use src >> transform >> load first"
         )
 
     stages = get_stages(_current_sink)
-    _next_position = 0
-    try:
-        asyncio.run(_run_async(stages))
-    finally:
-        _current_sink = None
+    logger.info("═" * 60)
+    logger.info(
+        f"Pipeline STARTING │ {' → '.join(s.name for s in stages)}"
+    )
+    logger.info("═" * 60)
+
+    asyncio.run(_run_async(stages))
+    _current_sink = None
 
 
-# ------------------------------------------------------------------
-# Decorator
-# ------------------------------------------------------------------
 def task(
     *,
     buffer: int = 0,
