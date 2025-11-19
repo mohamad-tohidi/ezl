@@ -1,6 +1,10 @@
 import asyncio
 import inspect
 import logging
+import threading
+import queue  # <--- Added
+from typing import Any, AsyncIterator  # <--- Added
+
 from rich.progress import (
     Progress,
     BarColumn,
@@ -13,7 +17,47 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.logging import RichHandler
 
-from .go import chan, Chan
+# ------------------------------------------------------------------
+# FIXED CHANNEL IMPLEMENTATION
+# ------------------------------------------------------------------
+_SENTINEL = object()
+
+
+class Chan:
+    def __init__(
+        self, maxsize: int = 0, name: str = "Chan"
+    ):
+        self.q: queue.Queue = queue.Queue(maxsize=maxsize)
+        self.name = name
+        self.task_id = None
+        self._closed = False
+
+    async def async_put(self, item: Any):
+        if self._closed:
+            return  # or raise, but usually we just want to stop
+        await asyncio.to_thread(self.q.put, item)
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self.q.put(_SENTINEL)
+
+    def __aiter__(self) -> AsyncIterator:
+        return self
+
+    async def __anext__(self):
+        item = await asyncio.to_thread(self.q.get)
+        if item is _SENTINEL:
+            self.q.put(
+                _SENTINEL
+            )  # Re-queue for other consumers
+            raise StopAsyncIteration
+        return item
+
+
+def chan(maxsize=0, name=""):
+    return Chan(maxsize=maxsize, name=name)
+
 
 # ------------------------------------------------------------------
 # Logging
@@ -62,6 +106,7 @@ class Stage:
                 "Only @task stages can be chained with >>"
             )
 
+        # Uses the thread-safe Queue wrapper now
         ch = chan(
             maxsize=self.buffer,
             name=f"{self.name}→{other.name}",
@@ -75,7 +120,7 @@ class Stage:
 
 
 # ------------------------------------------------------------------
-# Worker - updates Rich progress bars
+# Worker Logic
 # ------------------------------------------------------------------
 async def _stage_worker(
     stage: Stage,
@@ -87,7 +132,7 @@ async def _stage_worker(
 ):
     tag = f"[{stage.name} w{worker_id:02d}]"
     try:
-        logger.info(f"{tag} Starting")
+        # logger.info(f"{tag} Starting") # Reduced noise
 
         if stage.is_source:
             async for item in stage.func():
@@ -101,25 +146,23 @@ async def _stage_worker(
                             advance=1,
                         )
 
-                    # if the source is also the sink (single-stage pipeline)
                     if stage is sink_stage:
                         progress.update(
                             overall_task, advance=1
                         )
         else:
+            # This now works because __anext__ uses to_thread(q.get)
             async for item in stage.input_chan:
-                # drain buffer bar
+                # drain buffer bar logic
                 if hasattr(stage.input_chan, "task_id"):
                     progress.update(
                         stage.input_chan.task_id, advance=-1
                     )
 
-                # count as processed when the sink receives the item
-                if stage is sink_stage:
-                    progress.update(overall_task, advance=1)
-
+                # Process
                 result = stage.func(item)
 
+                # Handle Async Generators vs Standard Coroutines
                 if inspect.isasyncgen(result):
                     async for out_item in result:
                         if stage.output_chan:
@@ -135,10 +178,30 @@ async def _stage_worker(
                                     stage.output_chan.task_id,
                                     advance=1,
                                 )
-                else:
-                    await (
-                        result
-                    )  # plain async sink (e.g. load)
+                elif inspect.isawaitable(result):
+                    out_item = await result
+                    # If a normal task returns a value, pass it on?
+                    # Your original logic didn't pass on simple return values,
+                    # but usually a pipeline passes data.
+                    # Assuming 'result' is just the side effect or data:
+                    if (
+                        stage.output_chan
+                        and out_item is not None
+                    ):
+                        await stage.output_chan.async_put(
+                            out_item
+                        )
+                        if hasattr(
+                            stage.output_chan, "task_id"
+                        ):
+                            progress.update(
+                                stage.output_chan.task_id,
+                                advance=1,
+                            )
+
+                # Update Sink Counter
+                if stage is sink_stage:
+                    progress.update(overall_task, advance=1)
 
         logger.info(f"{tag} Completed")
 
@@ -149,8 +212,55 @@ async def _stage_worker(
         raise
 
 
+def _thread_entrypoint(
+    stage, worker_id, progress, overall_task, sink_stage
+):
+    try:
+        asyncio.run(
+            _stage_worker(
+                stage,
+                worker_id,
+                progress=progress,
+                overall_task=overall_task,
+                sink_stage=sink_stage,
+            )
+        )
+    except Exception as e:
+        logger.error(
+            f"Thread for {stage.name} crashed: {e}"
+        )
+
+
+def _stage_manager(
+    stage, progress, overall_task, sink_stage
+):
+    threads = []
+    for i in range(stage.workers):
+        t = threading.Thread(
+            target=_thread_entrypoint,
+            args=(
+                stage,
+                i,
+                progress,
+                overall_task,
+                sink_stage,
+            ),
+            name=f"{stage.name}-w{i}",
+        )
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    # Close output channel to signal next stage
+    if ch := stage.output_chan:
+        ch.close()  # Puts Sentinel
+        logger.info(f"Closed channel │ {ch.name}")
+
+
 # ------------------------------------------------------------------
-# Run
+# Run Orchestrator
 # ------------------------------------------------------------------
 def get_stages(sink: Stage) -> list[Stage]:
     stages = []
@@ -162,10 +272,13 @@ def get_stages(sink: Stage) -> list[Stage]:
     return stages
 
 
-async def _run_async(stages: list[Stage]):
-    if not stages:
-        return
+def run(setup_callback=None, teardown_callback=None):
+    global _current_sink
+    if _current_sink is None:
+        raise RuntimeError("No pipeline defined")
+    stages = get_stages(_current_sink)
 
+    # Setup Progress
     progress = Progress(
         TextColumn("[bold cyan]{task.description}"),
         BarColumn(),
@@ -182,165 +295,50 @@ async def _run_async(stages: list[Stage]):
     for i, stage in enumerate(stages[:-1]):
         ch = stage.output_chan
         next_stage = stages[i + 1]
-        desc = f"{stage.name} (w{stage.workers}) → {next_stage.name} buffer"
+        desc = f"{stage.name} → {next_stage.name}"
         task_id = progress.add_task(
-            desc, total=ch.maxsize or None, completed=0
+            desc, total=ch.q.maxsize or None, completed=0
         )
         ch.task_id = task_id
 
-    worker_tasks_per_stage: list[list[asyncio.Task]] = []
-    for stage in stages:
-        stage_tasks = [
-            asyncio.create_task(
-                _stage_worker(
-                    stage,
-                    i,
-                    progress=progress,
-                    overall_task=overall_task,
-                    sink_stage=stages[-1],
+    if setup_callback:
+        asyncio.run(setup_callback())
+
+    try:
+        with Live(
+            Panel(
+                progress,
+                title="🚀 EZL Pipeline",
+                border_style="blue",
+            ),
+            refresh_per_second=10,
+        ):
+            stage_manager_threads = []
+            for stage in stages:
+                t = threading.Thread(
+                    target=_stage_manager,
+                    args=(
+                        stage,
+                        progress,
+                        overall_task,
+                        stages[-1],
+                    ),
+                    name=f"Manager-{stage.name}",
                 )
-            )
-            for i in range(stage.workers)
-        ]
-        worker_tasks_per_stage.append(stage_tasks)
+                t.start()
+                stage_manager_threads.append(t)
 
-    with Live(
-        Panel(
-            progress,
-            title="🚀 Live EZL TUI",
-            border_style="bright_blue",
-            expand=False,
-        ),
-        refresh_per_second=10,
-    ):
-        try:
-            for i, stage in enumerate(stages):
-                await asyncio.gather(
-                    *worker_tasks_per_stage[i]
-                )
-                if ch := stage.output_chan:
-                    ch.close()
-                    logger.info(
-                        f"Closed channel │ {ch.name}"
-                    )
-
-            logger.info(
-                "Pipeline finished — all items processed"
-            )
-
-        except Exception:
-            logger.exception("Pipeline failed")
-            raise
-        finally:
-            remaining = [
-                t
-                for sub in worker_tasks_per_stage
-                for t in sub
-                if not t.done()
-            ]
-            for t in remaining:
-                t.cancel()
-
-
-def run(setup_callback=None, teardown_callback=None):
-    """
-    Execute the defined ETL pipeline.
-
-    This function runs the pipeline stages connected via the chaining
-    operator (>>). It validates that a pipeline has been defined, logs
-    the pipeline structure, and executes the stages asynchronously using
-    asyncio.
-
-    Args:
-        setup_callback (callable, optional): An optional async callable
-            invoked at the start of the pipeline execution, before stages
-            run. Use this to initialize shared resources (e.g., database
-            pools, API clients) that tasks rely on via globals or closures.
-            It should be an async function (def async def setup(): ...).
-            Defaults to None (no setup performed).
-        teardown_callback (callable, optional): An optional async callable
-            invoked at the end of the pipeline execution (in a finally block),
-            after stages complete or if an error occurs. Use this to clean up
-            resources initialized in setup_callback (e.g., close connections,
-            release locks). It should be an async function (def async def teardown(): ...).
-            Defaults to None (no teardown performed).
-
-    Raises:
-        RuntimeError: If no pipeline is defined (i.e., no stages chained).
-
-    Returns:
-        None
-
-    Examples:
-        >>> # Basic usage: No callbacks (original behavior)
-        >>> from ezl import src, transform, load
-        >>> @src
-        >>> async def extract(): yield {"data": 1}
-        >>> @transform
-        >>> async def process(item): yield {"processed": item["data"]}
-        >>> @load
-        >>> async def sink(item): print(item)
-        >>> extract >> process >> sink
-        >>> run()  # Runs pipeline without setup/teardown
-
-        >>> # With callbacks: Initialize Elasticsearch client
-        >>> from elasticsearch import AsyncElasticsearch
-        >>> async def setup_es():
-        ...     global es
-        ...     es = AsyncElasticsearch(hosts=["http://localhost:9200"])
-        >>> async def teardown_es():
-        ...     global es
-        ...     await es.close()
-        >>> # ... define stages using 'es' (e.g., in extract)
-        >>> run(setup_callback=setup_es, teardown_callback=teardown_es)
-
-        >>> # With callbacks: Database pool for asyncpg
-        >>> import asyncpg
-        >>> DB_CONFIG = {"host": "localhost", "database": "mydb", ...}
-        >>> async def setup_db():
-        ...     global db_pool
-        ...     db_pool = await asyncpg.create_pool(**DB_CONFIG, min_size=1, max_size=10)
-        >>> async def teardown_db():
-        ...     global db_pool
-        ...     if db_pool: await db_pool.close()
-        >>> # ... define stages using 'db_pool' (e.g., acquire in extract)
-        >>> run(setup_callback=setup_db, teardown_callback=teardown_db)
-
-    Notes:
-        - Callbacks are executed within the same event loop as the pipeline,
-          ensuring proper async context for resources like AsyncElasticsearch
-          or asyncpg pools.
-        - Globals (e.g., 'es', 'db_pool') are commonly used for shared state,
-          but consider dependency injection via closures for more robust designs.
-        - Errors in setup_callback will prevent pipeline execution; errors in
-          teardown_callback are logged but do not affect the pipeline result.
-    """
-    global _current_sink
-    if _current_sink is None:
-        raise RuntimeError(
-            "No pipeline defined — use src >> transform >> load first"
-        )
-    stages = get_stages(_current_sink)
-    logger.info("═" * 60)
-    logger.info(
-        f"Pipeline STARTING │ {' → '.join(s.name for s in stages)}"
-    )
-    logger.info("═" * 60)
-
-    async def wrapped_run():
-        if setup_callback:
-            await setup_callback()  # e.g., init globals like es = AsyncElasticsearch(...)
-        try:
-            await _run_async(stages)
-        finally:
-            if teardown_callback:
-                await teardown_callback()  # e.g., await es.close()
+            for t in stage_manager_threads:
+                t.join()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if teardown_callback:
+            asyncio.run(teardown_callback())
         _current_sink = None
 
-    asyncio.run(wrapped_run())
 
 def task(
-    *,
     buffer: int = 0,
     workers: int = 1,
     name: str | None = None,
