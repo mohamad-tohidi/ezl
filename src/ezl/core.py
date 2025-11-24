@@ -1,4 +1,6 @@
 # ezl/__init__.py
+import asyncio
+import inspect
 import logging
 import queue
 import threading
@@ -19,10 +21,12 @@ logger = logging.getLogger(__name__)
 
 
 class Task:
-    """A pipeline task that processes data items"""
+    """A pipeline task that processes data items (sync or async)"""
     
     def __init__(self, func: Callable, buffer: int, workers: int):
         self.func = func
+        self.is_async = inspect.iscoroutinefunction(func) or inspect.isasyncgenfunction(func)
+        self.is_generator = inspect.isgeneratorfunction(func) or inspect.isasyncgenfunction(func)
         self.buffer = buffer
         self.workers = workers
         self.name = func.__name__
@@ -55,8 +59,16 @@ class Task:
             self._threads.append(thread)
 
     def _worker_loop(self):
-        """Process items from the input queue"""
+        """Dispatch to sync or async worker loop"""
         logger.debug(f"Worker {threading.current_thread().name} started")
+        if self.is_async:
+            asyncio.run(self._async_worker_loop())
+        else:
+            self._sync_worker_loop()
+        logger.debug(f"Worker {threading.current_thread().name} stopped")
+
+    def _sync_worker_loop(self):
+        """Process items from queue using sync function"""
         while not self._stop_event.is_set():
             try:
                 item = self.input_queue.get(timeout=0.5)
@@ -64,23 +76,46 @@ class Task:
                 
                 try:
                     result = self.func(item)
-                    logger.flow(f"PROC [{self.name}]")
                     
-                    # Handle functions that return/yield multiple items
-                    if hasattr(result, '__iter__') and not isinstance(result, (str, bytes, dict)):
+                    if self.is_generator:
                         for out_item in result:
+                            logger.flow(f"PROC [{self.name}]")
                             self._send_downstream(out_item)
                     elif result is not None:
+                        logger.flow(f"PROC [{self.name}]")
                         self._send_downstream(result)
                 except Exception as e:
                     logger.error(f"Error in '{self.name}': {e}", exc_info=True)
                 finally:
                     self.input_queue.task_done()
-                    
             except queue.Empty:
-                continue  # Just check stop event again
+                continue
+
+    async def _async_worker_loop(self):
+        """Process items from queue using async function"""
+        while not self._stop_event.is_set():
+            try:
+                item = self.input_queue.get(timeout=0.5)
+                logger.flow(f"PULL [{self.name}]")
                 
-        logger.debug(f"Worker {threading.current_thread().name} stopped")
+                try:
+                    result = self.func(item)
+                    
+                    if inspect.isasyncgen(result):
+                        async for out_item in result:
+                            logger.flow(f"PROC [{self.name}]")
+                            self._send_downstream(out_item)
+                    else:
+                        out_item = await result
+                        logger.flow(f"PROC [{self.name}]")
+                        if out_item is not None:
+                            self._send_downstream(out_item)
+                except Exception as e:
+                    logger.error(f"Error in '{self.name}': {e}", exc_info=True)
+                finally:
+                    self.input_queue.task_done()
+            except queue.Empty:
+                continue
 
     def _send_downstream(self, item: Any):
         """Route an item to the next task"""
@@ -96,7 +131,7 @@ class Task:
 
     def wait_for_queue(self):
         """Wait until all queued items are processed"""
-        if self.upstream:  # Only relevant for non-sources
+        if self.upstream:
             self.input_queue.join()
 
     def stop_gracefully(self):
@@ -113,11 +148,8 @@ class Pipeline:
     """A directed pipeline of connected tasks"""
     
     def __init__(self, task1: Task, task2: Task):
-        # Link the tasks
         task1.downstream = task2
         task2.upstream.append(task1)
-        
-        # Track all tasks in the pipeline
         self.tasks: List[Task] = [task1, task2]
         self.source = task1
         self.sink = task2
@@ -127,28 +159,45 @@ class Pipeline:
         if not isinstance(other, Task):
             return NotImplemented
         
-        # Link current sink to new task
         self.sink.downstream = other
         other.upstream.append(self.sink)
-        
-        # Update pipeline tracking
         self.tasks.append(other)
         self.sink = other
         return self
 
-    def _run_source(self, source: Task):
-        """Execute a source task (no input queue)"""
+    def _run_source_sync(self, source: Task):
+        """Execute a sync source task"""
         logger.info(f"Running source '{source.name}'...")
         try:
-            result = source.func()  # Source functions take no arguments
-            
+            result = source.func()
             count = 0
-            if hasattr(result, '__iter__') and not isinstance(result, (str, bytes, dict)):
+            
+            if source.is_generator:
                 for item in result:
                     source._send_downstream(item)
                     count += 1
             elif result is not None:
                 source._send_downstream(result)
+                count = 1
+                
+            logger.info(f"Source '{source.name}' completed ({count} items)")
+        except Exception as e:
+            logger.error(f"Source '{source.name}' failed: {e}", exc_info=True)
+
+    async def _run_source_async(self, source: Task):
+        """Execute an async source task"""
+        logger.info(f"Running async source '{source.name}'...")
+        try:
+            result = source.func()
+            count = 0
+            
+            if inspect.isasyncgen(result):
+                async for item in result:
+                    source._send_downstream(item)
+                    count += 1
+            else:
+                item = await result
+                source._send_downstream(item)
                 count = 1
                 
             logger.info(f"Source '{source.name}' completed ({count} items)")
@@ -162,7 +211,6 @@ class Pipeline:
         Args:
             log_level: Logging level (use logging.DEBUG to see flow events)
         """
-        # Setup logging
         logging.basicConfig(
             level=log_level,
             format='%(levelname)-8s | %(message)s'
@@ -172,31 +220,37 @@ class Pipeline:
         logger.info("=" * 50)
         logger.info("🚀 Pipeline Starting...")
         
-        # 1. Start workers for all non-source tasks
+        # Start workers for all non-source tasks
         for task in self.tasks:
             task.start_workers()
         
-        # 2. Run source tasks in dedicated threads
+        # Run source tasks
         source_tasks = [t for t in self.tasks if not t.upstream]
-        source_threads = [
-            threading.Thread(target=self._run_source, args=(src,), daemon=True)
-            for src in source_tasks
-        ]
+        source_threads = []
         
-        for th in source_threads:
-            th.start()
-            
-        # 3. Wait for sources to finish generating
+        for src in source_tasks:
+            if src.is_async:
+                def target(s=src):
+                    return asyncio.run(self._run_source_async(s))
+            else:
+                def target(s=src):
+                    return self._run_source_sync(s)
+                
+            thread = threading.Thread(target=target, daemon=True)
+            thread.start()
+            source_threads.append(thread)
+        
+        # Wait for sources to complete
         for th in source_threads:
             th.join()
         
         logger.info("Sources complete. Draining queues...")
         
-        # 4. Wait for all intermediate queues to empty
+        # Wait for all queues to empty
         for task in self.tasks:
             task.wait_for_queue()
         
-        # 5. Shutdown all workers
+        # Shutdown
         logger.info("Processing complete. Shutting down...")
         for task in self.tasks:
             task.signal_stop()
@@ -209,7 +263,7 @@ class Pipeline:
 
 def task(buffer: int = 100, workers: int = 3):
     """
-    Decorator to create a pipeline task
+    Decorator to create a pipeline task (sync or async)
     
     Args:
         buffer: Max size of the input queue
