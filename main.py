@@ -30,7 +30,7 @@ def transform(item):
         }
 
 
-@task(buffer=50, workers=2)
+@task(buffer=0, workers=2)
 async def load(item):
     """Load: Async database insertion"""
     await asyncio.sleep(0.05)  # async I/O

@@ -1,5 +1,6 @@
 from src.ezl.core import webhook, task, run
 from pydantic import BaseModel
+import time
 
 
 class DocModel(BaseModel):
@@ -20,14 +21,15 @@ class DocModel(BaseModel):
     # hmac_secret=HMAC_SECRET,
     model=DocModel,
     rate_limit_per_minute=30,
-    buffer=200,
+    buffer=2,
 )
 def extract():
     pass
 
 
-@task(buffer=100, workers=3)
+@task(buffer=100, workers=1)
 def transform(item):
+    time.sleep(2)
     # ... same transform as before
     return item
 

@@ -65,7 +65,7 @@ if __name__ == "__main__":
     print("- Expected sum of processed values: 99,990,000")
     print("=" * 60)
 
-    run(pipeline=pipeline)
+    run(p=pipeline)
 
     # Verification after pipeline completes
     actual_count = len(processed_values)

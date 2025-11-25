@@ -1,21 +1,23 @@
 # ezl/core.py
+"""
+Minimal ezl core with `match` usage and compact OpenAPI support.
+
+Assumptions:
+- Task functions are one of: sync, sync_gen, async, async_gen.
+- We classify function kind once at decoration time.
+- Workers use blocking downstream.put() for deterministic backpressure.
+- Webhook start will inject model schema into OpenAPI for single + batch endpoints.
+"""
+
 import asyncio
 import inspect
 import logging
 import queue
 import threading
-from typing import (
-    Callable,
-    Any,
-    List,
-    Optional,
-    Dict,
-    Type,
-)
 import time
-import hmac
-import hashlib
 from collections import defaultdict, deque
+from typing import Any, Callable, Dict, List, Optional, Type
+
 from fastapi import FastAPI, Request
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import (
@@ -23,254 +25,238 @@ from fastapi.responses import (
     PlainTextResponse,
 )
 import uvicorn
-from pydantic import (
-    BaseModel,
-    ValidationError,
-)
+from pydantic import BaseModel, ValidationError
 
-# Small compatibility: FastAPI uses Starlette under the hood for Request/Response types,
-# so our previous logic works well with FastAPI's Request.
-
+# small custom level for flow tracing
 FLOW_LEVEL = 25
 logging.addLevelName(FLOW_LEVEL, "FLOW")
 
 
-def _flow(self, message, *args, **kwargs):
-    """Custom logger method for flow events"""
+def _flow(self, msg, *a, **k):
     if self.isEnabledFor(FLOW_LEVEL):
-        self._log(FLOW_LEVEL, message, args, **kwargs)
+        self._log(FLOW_LEVEL, msg, a, **k)
 
 
 logging.Logger.flow = _flow
-
-# Module logger
 logger = logging.getLogger(__name__)
 
 
 class Task:
-    """A pipeline task that processes data items (sync or async)"""
+    """A node in the pipeline. Uses match/case for clarity."""
 
     def __init__(
         self, func: Callable, buffer: int, workers: int
     ):
         self.func = func
-        self.is_async = inspect.iscoroutinefunction(
-            func
-        ) or inspect.isasyncgenfunction(func)
-        self.is_generator = inspect.isgeneratorfunction(
-            func
-        ) or inspect.isasyncgenfunction(func)
-        self.buffer = buffer
-        self.workers = workers
-        self.name = func.__name__
+        self.name = getattr(func, "__name__", "task")
+        self.buffer = max(1, buffer)
+        self.workers = max(0, workers)
         self.upstream: List["Task"] = []
         self.downstream: Optional["Task"] = None
-        self.input_queue = queue.Queue(maxsize=buffer)
-        self._stop_event = threading.Event()
+        self.input_queue: queue.Queue = queue.Queue(
+            maxsize=self.buffer
+        )
+        self._stop = threading.Event()
         self._threads: List[threading.Thread] = []
 
-        # webhook attributes
-        self.is_webhook: bool = False
+        # classify function kind once
+        if inspect.isasyncgenfunction(func):
+            self.kind = "async_gen"
+        elif inspect.iscoroutinefunction(func):
+            self.kind = "async"
+        elif inspect.isgeneratorfunction(func):
+            self.kind = "sync_gen"
+        else:
+            self.kind = "sync"
+
+        # webhook-related
+        self.is_webhook = False
         self.webhook_conf: Dict[str, Any] = {}
-        self._webhook_server: Optional[uvicorn.Server] = (
-            None
-        )
+        self._webhook_server = None
         self._webhook_thread: Optional[threading.Thread] = (
             None
         )
 
-    def __rshift__(self, other: "Task") -> "Pipeline":
-        """Connect tasks: task1 >> task2"""
+    def __rshift__(self, other: "Task"):
         if not isinstance(other, Task):
             return NotImplemented
         return Pipeline(self, other)
 
+    # -------------------------
+    # worker lifecycle
+    # -------------------------
     def start_workers(self):
-        """Start worker threads (only for non-source tasks)"""
         if not self.upstream:
             logger.debug(
-                f"No workers needed for source '{self.name}'"
+                f"'{self.name}' has no upstream -> no workers"
             )
             return
-
         logger.info(
-            f"Starting {self.workers} workers for '{self.name}'"
+            f"Starting {self.workers} worker(s) for '{self.name}'"
         )
         for i in range(self.workers):
-            thread = threading.Thread(
+            t = threading.Thread(
                 target=self._worker_loop,
                 name=f"{self.name}-{i}",
                 daemon=True,
             )
-            thread.start()
-            self._threads.append(thread)
+            t.start()
+            self._threads.append(t)
 
     def _worker_loop(self):
-        """Dispatch to sync or async worker loop"""
         logger.debug(
-            f"Worker {threading.current_thread().name} started"
+            f"Worker {threading.current_thread().name} starting ({self.kind})"
         )
-        if self.is_async:
-            asyncio.run(self._async_worker_loop())
-        else:
-            self._sync_worker_loop()
-        logger.debug(
-            f"Worker {threading.current_thread().name} stopped"
-        )
+        try:
+            match self.kind:
+                case "async" | "async_gen":
+                    asyncio.run(self._async_worker())
+                case _:
+                    self._sync_worker()
+        finally:
+            logger.debug(
+                f"Worker {threading.current_thread().name} exiting"
+            )
 
-    def _sync_worker_loop(self):
-        """Process items from queue using sync function"""
-        while not self._stop_event.is_set():
+    def _sync_worker(self):
+        while not self._stop.is_set():
             try:
                 item = self.input_queue.get(timeout=0.5)
                 logger.flow(f"PULL [{self.name}]")
-
                 try:
-                    result = self.func(item)
-
-                    if self.is_generator:
-                        for out_item in result:
-                            logger.flow(
-                                f"PROC [{self.name}]"
+                    match self.kind:
+                        case "sync_gen":
+                            for out in self.func(item):
+                                logger.flow(
+                                    f"PROC [{self.name}]"
+                                )
+                                self._send_downstream(out)
+                        case "sync":
+                            out = self.func(item)
+                            if out is not None:
+                                logger.flow(
+                                    f"PROC [{self.name}]"
+                                )
+                                self._send_downstream(out)
+                        case _:
+                            # should not happen
+                            logger.error(
+                                f"Unexpected kind in sync worker: {self.kind}"
                             )
-                            self._send_downstream(out_item)
-                    elif result is not None:
-                        logger.flow(f"PROC [{self.name}]")
-                        self._send_downstream(result)
-                except Exception as e:
-                    logger.error(
-                        f"Error in '{self.name}': {e}",
-                        exc_info=True,
+                except Exception:
+                    logger.exception(
+                        f"Error in '{self.name}'"
                     )
                 finally:
                     self.input_queue.task_done()
             except queue.Empty:
                 continue
 
-    async def _async_worker_loop(self):
-        """Process items from queue using async function"""
-        while not self._stop_event.is_set():
+    async def _async_worker(self):
+        while not self._stop.is_set():
             try:
                 item = self.input_queue.get(timeout=0.5)
                 logger.flow(f"PULL [{self.name}]")
-
                 try:
-                    result = self.func(item)
-
-                    if inspect.isasyncgen(result):
-                        async for out_item in result:
-                            logger.flow(
-                                f"PROC [{self.name}]"
+                    match self.kind:
+                        case "async_gen":
+                            agen = self.func(item)
+                            async for out in agen:
+                                logger.flow(
+                                    f"PROC [{self.name}]"
+                                )
+                                self._send_downstream(out)
+                        case "async":
+                            out = await self.func(item)
+                            if out is not None:
+                                logger.flow(
+                                    f"PROC [{self.name}]"
+                                )
+                                self._send_downstream(out)
+                        case _:
+                            logger.error(
+                                f"Unexpected kind in async worker: {self.kind}"
                             )
-                            self._send_downstream(out_item)
-                    else:
-                        out_item = await result
-                        logger.flow(f"PROC [{self.name}]")
-                        if out_item is not None:
-                            self._send_downstream(out_item)
-                except Exception as e:
-                    logger.error(
-                        f"Error in '{self.name}': {e}",
-                        exc_info=True,
+                except Exception:
+                    logger.exception(
+                        f"Error in async '{self.name}'"
                     )
                 finally:
                     self.input_queue.task_done()
             except queue.Empty:
+                await asyncio.sleep(0.01)
                 continue
 
     def _send_downstream(self, item: Any):
-        """Route an item to the next task"""
-        if self.downstream:
-            logger.flow(
-                f"PUT  [{self.name}] -> [{self.downstream.name}]"
-            )
-            self.downstream.input_queue.put(item)
-        else:
+        if not self.downstream:
             logger.debug(
                 f"'{self.name}' sink processed item"
             )
+            return
+        logger.flow(
+            f"PUT  [{self.name}] -> [{self.downstream.name}]"
+        )
+        try:
+            # blocking put for deterministic backpressure
+            self.downstream.input_queue.put(
+                item, block=True
+            )
+        except Exception:
+            logger.exception(
+                f"Failed to put into downstream '{self.downstream.name}'"
+            )
+
+    def wait_for_queue(self):
+        if self.upstream:
+            self.input_queue.join()
 
     def signal_stop(self):
-        """Signal worker threads to stop. Also stop webhook server (if any)"""
-        self._stop_event.set()
+        self._stop.set()
         if (
             self.is_webhook
             and self._webhook_server is not None
         ):
-            logger.debug(
-                f"Stopping webhook server for '{self.name}'"
-            )
             try:
                 self._webhook_server.should_exit = True
             except Exception:
                 logger.exception(
-                    "Error while signaling webhook server to stop"
+                    "Error stopping webhook server"
                 )
 
-    def wait_for_queue(self):
-        """Wait until all queued items are processed"""
-        if self.upstream:
-            self.input_queue.join()
-
     def stop_gracefully(self):
-        """Stop workers and wait for them to finish. Join webhook thread if present."""
-        if not self._threads and not (
-            self.is_webhook and self._webhook_thread
-        ):
-            return
-        logger.debug(f"Stopping workers for '{self.name}'")
         self.signal_stop()
-        for thread in self._threads:
-            thread.join(timeout=2)
-
+        for t in self._threads:
+            t.join(timeout=2)
         if self.is_webhook and self._webhook_thread:
             self._webhook_thread.join(timeout=3)
 
-    # --------------------------
-    # webhook helpers (with auth, HMAC, validation, rate-limiting)
-    # --------------------------
-    def _make_fastapi_app(
+    # -------------------------
+    # webhook + OpenAPI
+    # -------------------------
+    def _build_fastapi(
         self,
         path: str,
         *,
-        api_key: Optional[str] = None,
-        hmac_secret: Optional[bytes] = None,
-        model: Optional[Type[BaseModel]] = None,
-        rate_limit_per_minute: Optional[int] = None,
+        api_key: Optional[str],
+        model: Optional[Type[BaseModel]],
+        rate_limit_per_minute: Optional[int],
     ):
-        """
-        Build a FastAPI app for this webhook endpoint, optionally creating:
-        - single-item POST at `path`
-        - typed `/batch` POST at `path + "/batch"` when `model` is provided
-        The `/batch` route is annotated with List[model] so OpenAPI shows fields clearly.
-        """
-        app = FastAPI(title=f"EZL webhook: {self.name}")
+        app = FastAPI(title=f"ezl:webhook:{self.name}")
 
-        # Simple in-memory sliding window rate limiter
-        window_seconds = 60
-        if (
-            rate_limit_per_minute is not None
-            and rate_limit_per_minute > 0
-        ):
+        window = 60
+        if rate_limit_per_minute:
             counters: Dict[str, deque] = defaultdict(deque)
             counters_lock = asyncio.Lock()
         else:
             counters = None
             counters_lock = None
 
-        # -----------------------
-        # Single-item endpoint
-        # -----------------------
-        @app.post(
-            path, summary="Ingest single webhook item"
-        )
-        async def handle_single(request: Request):
-            # Only POST — keep the check for safety
+        @app.post(path, summary="ingest single")
+        async def single(request: Request):
             if request.method != "POST":
                 return PlainTextResponse(
                     "Method not allowed", status_code=405
                 )
-
             client_ip = (
                 request.client.host
                 if request.client
@@ -278,7 +264,6 @@ class Task:
             )
             identity = client_ip
 
-            # API key auth (optional)
             if api_key is not None:
                 incoming = request.headers.get(
                     "x-api-key"
@@ -293,17 +278,11 @@ class Task:
                     )
                 identity = f"api_key:{incoming}"
 
-            # Rate limiting (optional)
-            if (
-                counters is not None
-                and counters_lock is not None
-            ):
+            if counters is not None:
                 now = time.time()
                 async with counters_lock:
                     dq = counters[identity]
-                    while (
-                        dq and dq[0] <= now - window_seconds
-                    ):
+                    while dq and dq[0] <= now - window:
                         dq.popleft()
                     if len(dq) >= rate_limit_per_minute:
                         logger.flow(
@@ -317,7 +296,6 @@ class Task:
                         )
                     dq.append(now)
 
-            # Parse JSON
             try:
                 payload = await request.json()
             except Exception:
@@ -326,113 +304,71 @@ class Task:
                     status_code=400,
                 )
 
-            # If array -> instruct to use /batch
             if isinstance(payload, list):
                 return JSONResponse(
-                    {
-                        "error": "Batch payloads should be POSTed to the /batch endpoint"
-                    },
+                    {"error": "Use /batch for arrays"},
                     status_code=400,
                 )
 
-            # Validate single item (if model provided)
-            accepted = 0
-            rejected = 0
             if model is not None:
                 try:
                     validated = model.model_validate(
                         payload
                     )
-                    obj_to_enqueue = validated.model_dump()
-                    accepted = 1
-                except ValidationError as ve:
-                    rejected = 1
-                    logger.debug(
-                        f"Validation failed for item: {ve}"
-                    )
+                    obj = validated.model_dump()
+                except ValidationError:
                     return JSONResponse(
-                        {
-                            "accepted": accepted,
-                            "rejected": rejected,
-                        },
+                        {"accepted": 0, "rejected": 1},
                         status_code=422,
                     )
             else:
-                obj_to_enqueue = payload
-                accepted = 1
+                obj = payload
 
-            # Enqueue
             if self.downstream:
                 try:
                     self.downstream.input_queue.put(
-                        obj_to_enqueue
+                        obj, block=False
                     )
-
                 except queue.Full:
                     logger.flow(
-                        f"WEBHOOK [{self.name}] queue full -> rejecting single item"
+                        f"WEBHOOK [{self.name}] queue full -> rejecting"
                     )
                     return JSONResponse(
                         {
                             "accepted": 0,
                             "rejected": 1,
-                            "error": "Queue is full. Please retry after a few seconds.",
+                            "error": "Queue full",
                         },
                         status_code=503,
-                        headers={"Retry-After": 10},
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Failed to enqueue item for '{self.name}': {e}"
-                    )
-                    return JSONResponse(
-                        {"error": "Failed to enqueue"},
-                        status_code=500,
+                        headers={"Retry-After": "10"},
                     )
             else:
                 logger.warning(
-                    f"Webhook '{self.name}' received data but no downstream is attached"
+                    f"Webhook '{self.name}' has no downstream"
                 )
 
-            logger.flow(
-                f"WEBHOOK [{self.name}] accepted={accepted} rejected={rejected}"
-            )
+            logger.flow(f"WEBHOOK [{self.name}] accepted=1")
             return JSONResponse(
-                {
-                    "accepted": accepted,
-                    "rejected": rejected,
-                },
+                {"accepted": 1, "rejected": 0},
                 status_code=202,
             )
 
-        # -----------------------
-        # Batch endpoint (typed) - only add if a pydantic model is provided
-        # -----------------------
+        # batch route if model present
         if model is not None:
-            # create route path for batch (ensure no double-slash)
             batch_path = path.rstrip("/") + "/batch"
 
-            async def handle_batch(
-                items: list[model],  # type: ignore
-            ):
-                """
-                Accepts a JSON array of items matching the provided pydantic model.
-                This function body will run after FastAPI has validated & parsed items into model instances.
-                """
+            async def batch(items: list[model]):  # type: ignore
                 accepted = 0
                 rejected = 0
                 for inst in items:
                     try:
-                        # inst is a model instance (validated)
-                        obj_to_enqueue = inst.dict()
+                        obj = inst.model_dump()
                         if self.downstream:
                             self.downstream.input_queue.put(
-                                obj_to_enqueue
+                                obj, block=False
                             )
                             accepted += 1
-
                     except queue.Full:
-                        # downstream is full; ask client to retry after a short pause
                         logger.flow(
                             f"WEBHOOK [{self.name}] queue full during batch -> accepted={accepted}"
                         )
@@ -441,18 +377,12 @@ class Task:
                                 "accepted": accepted,
                                 "rejected": len(items)
                                 - accepted,
-                                "error": "Queue is full. Some items were accepted; please retry remaining items after a few seconds.",
+                                "error": "Queue full",
                             },
                             status_code=503,
-                            headers={"Retry-After": 10},
                         )
-
-                    except Exception as e:
-                        logger.error(
-                            f"Failed to enqueue item for '{self.name}': {e}"
-                        )
+                    except Exception:
                         rejected += 1
-
                 logger.flow(
                     f"WEBHOOK [{self.name}] batch accepted={accepted} rejected={rejected}"
                 )
@@ -464,350 +394,266 @@ class Task:
                     status_code=202,
                 )
 
-            # Register the batch route. We give it an explicit summary so docs look nice.
-            app.post(
-                batch_path, summary="Ingest batch of items"
-            )(handle_batch)
+            app.post(batch_path, summary="ingest batch")(
+                batch
+            )
 
+            # inject model schema for nicer OpenAPI docs
             def custom_openapi():
                 if app.openapi_schema:
                     return app.openapi_schema
-                openapi_schema = get_openapi(
+                schema = get_openapi(
                     title=app.title,
                     version="1.0.0",
                     routes=app.routes,
                 )
-                # ensure model schema is in components
                 try:
                     model_schema = model.model_json_schema(
                         ref_template="#/components/schemas/{model}"
                     )
                 except Exception:
                     model_schema = model.model_json_schema()
-
-                comp = openapi_schema.setdefault(
+                comp = schema.setdefault(
                     "components", {}
                 ).setdefault("schemas", {})
                 comp.setdefault(
                     model.__name__, model_schema
                 )
 
-                path_item = openapi_schema.get(
-                    "paths", {}
-                ).get(path)
-                if path_item and "post" in path_item:
-                    post_op = path_item["post"]
-                    post_op["requestBody"] = {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "$ref": f"#/components/schemas/{model.__name__}"
-                                }
-                            }
-                        },
-                        "required": True,
-                    }
-
-                # For batch path: requestBody -> array of model
-                batch_item = openapi_schema.get(
-                    "paths", {}
-                ).get(batch_path)
-                if batch_item and "post" in batch_item:
-                    post_op = batch_item["post"]
-                    post_op["requestBody"] = {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "array",
-                                    "items": {
+                # annotate single endpoint requestBody
+                if path in schema.get("paths", {}):
+                    post = schema["paths"][path].get("post")
+                    if post:
+                        post["requestBody"] = {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
                                         "$ref": f"#/components/schemas/{model.__name__}"
-                                    },
+                                    }
                                 }
-                            }
-                        },
-                        "required": True,
-                    }
+                            },
+                            "required": True,
+                        }
 
-                app.openapi_schema = openapi_schema
-                return app.openapi_schema
+                # annotate batch endpoint
+                bp = batch_path
+                if bp in schema.get("paths", {}):
+                    post = schema["paths"][bp].get("post")
+                    if post:
+                        post["requestBody"] = {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": {
+                                            "$ref": f"#/components/schemas/{model.__name__}"
+                                        },
+                                    }
+                                }
+                            },
+                            "required": True,
+                        }
+
+                app.openapi_schema = schema
+                return schema
 
             app.openapi = custom_openapi
-        else:
-            # If no model provided, we still supply a default openapi so docs show the route exists
-            def custom_openapi_no_model():
-                if app.openapi_schema:
-                    return app.openapi_schema
-                openapi_schema = get_openapi(
-                    title=app.title,
-                    version="1.0.0",
-                    routes=app.routes,
-                )
-                app.openapi_schema = openapi_schema
-                return app.openapi_schema
-
-            app.openapi = custom_openapi_no_model
 
         return app
 
     def start_webhook(
         self,
+        *,
         host: str = "0.0.0.0",
         port: int = 8000,
         path: str = "/",
         api_key: Optional[str] = None,
-        hmac_secret: Optional[bytes] = None,
         model: Optional[Type[BaseModel]] = None,
         rate_limit_per_minute: Optional[int] = None,
     ):
-        """
-        Start a uvicorn server running a FastAPI app for this task.
-        It will run in a background thread. Server will observe server.should_exit to stop.
-        """
         if not self.is_webhook:
             raise RuntimeError(
-                "start_webhook called on non-webhook task"
+                "start_webhook on non-webhook task"
             )
-
-        app = self._make_fastapi_app(
+        app = self._build_fastapi(
             path,
             api_key=api_key,
-            hmac_secret=hmac_secret,
             model=model,
             rate_limit_per_minute=rate_limit_per_minute,
         )
-
-        config = uvicorn.Config(
+        cfg = uvicorn.Config(
             app, host=host, port=port, log_level="info"
         )
-        server = uvicorn.Server(config=config)
+        server = uvicorn.Server(config=cfg)
 
-        def _run_server():
+        def _serve():
             logger.info(
-                f"Starting webhook server for '{self.name}' at http://{host}:{port}{path}"
+                f"Starting webhook {self.name} at http://{host}:{port}{path}"
             )
             server.run()
-            logger.info(
-                f"Webhook server for '{self.name}' stopped"
-            )
+            logger.info("Webhook stopped")
 
-        thread = threading.Thread(
-            target=_run_server,
+        thr = threading.Thread(
+            target=_serve,
             name=f"webhook-{self.name}",
             daemon=True,
         )
-        thread.start()
-
+        thr.start()
         self._webhook_server = server
-        self._webhook_thread = thread
+        self._webhook_thread = thr
 
 
 class Pipeline:
-    """A directed pipeline of connected tasks"""
+    """Tiny pipeline container and runner using match/case."""
 
-    def __init__(self, task1: Task, task2: Task):
-        task1.downstream = task2
-        task2.upstream.append(task1)
-        self.tasks: List[Task] = [task1, task2]
-        self.source = task1
-        self.sink = task2
+    def __init__(self, a: Task, b: Task):
+        a.downstream = b
+        b.upstream.append(a)
+        self.tasks: List[Task] = [a, b]
+        self.source = a
+        self.sink = b
 
-    def __rshift__(self, other: Task) -> "Pipeline":
-        """Extend pipeline: pipeline >> task"""
+    def __rshift__(self, other: Task):
         if not isinstance(other, Task):
             return NotImplemented
-
         self.sink.downstream = other
         other.upstream.append(self.sink)
         self.tasks.append(other)
         self.sink = other
         return self
 
-    def _run_source_sync(self, source: Task):
-        """Execute a sync source task"""
-        logger.info(f"Running source '{source.name}'...")
+    def _run_source_sync(self, src: Task):
+        logger.info(f"Running source '{src.name}' (sync)")
         try:
-            result = source.func()
-            count = 0
+            match src.kind:
+                case "sync_gen":
+                    for it in src.func():
+                        src._send_downstream(it)
+                case "sync":
+                    out = src.func()
+                    if out is not None:
+                        src._send_downstream(out)
+                case _:
+                    logger.error(
+                        f"Unexpected source kind: {src.kind}"
+                    )
+        except Exception:
+            logger.exception(f"Source '{src.name}' failed")
 
-            if source.is_generator:
-                for item in result:
-                    source._send_downstream(item)
-                    count += 1
-            elif result is not None:
-                source._send_downstream(result)
-                count = 1
-
-            logger.info(
-                f"Source '{source.name}' completed ({count} items)"
-            )
-        except Exception as e:
-            logger.error(
-                f"Source '{source.name}' failed: {e}",
-                exc_info=True,
-            )
-
-    async def _run_source_async(self, source: Task):
-        """Execute an async source task"""
-        logger.info(
-            f"Running async source '{source.name}'..."
-        )
+    async def _run_source_async(self, src: Task):
+        logger.info(f"Running source '{src.name}' (async)")
         try:
-            result = source.func()
-            count = 0
-
-            if inspect.isasyncgen(result):
-                async for item in result:
-                    source._send_downstream(item)
-                    count += 1
-            else:
-                item = await result
-                source._send_downstream(item)
-                count = 1
-
-            logger.info(
-                f"Source '{source.name}' completed ({count} items)"
-            )
-        except Exception as e:
-            logger.error(
-                f"Source '{source.name}' failed: {e}",
-                exc_info=True,
+            match src.kind:
+                case "async_gen":
+                    async for it in src.func():
+                        src._send_downstream(it)
+                case "async":
+                    out = await src.func()
+                    if out is not None:
+                        src._send_downstream(out)
+                case _:
+                    logger.error(
+                        f"Unexpected async source kind: {src.kind}"
+                    )
+        except Exception:
+            logger.exception(
+                f"Async source '{src.name}' failed"
             )
 
     def run(self, log_level: int = logging.INFO):
-        """
-        Execute the pipeline
-
-        Args:
-            log_level: Logging level (use logging.DEBUG to see flow events)
-        """
         logging.basicConfig(
             level=log_level,
             format="%(levelname)-8s | %(message)s",
         )
         logger.setLevel(log_level)
+        logger.info("🚀 Pipeline starting")
 
-        logger.info("=" * 50)
-        logger.info("🚀 Pipeline Starting...")
+        for t in self.tasks:
+            t.start_workers()
 
-        # Start workers for all non-source tasks
-        for task in self.tasks:
-            task.start_workers()
-
-        # Run source tasks
         source_tasks = [
             t for t in self.tasks if not t.upstream
         ]
-        source_threads = []
+        threads: List[threading.Thread] = []
 
-        for src in source_tasks:
-            # If the source is a webhook, start server instead of running the source function
-            if getattr(src, "is_webhook", False):
-                host = src.webhook_conf.get(
-                    "host", "0.0.0.0"
+        for s in source_tasks:
+            if getattr(s, "is_webhook", False):
+                conf = s.webhook_conf
+                s.start_webhook(
+                    host=conf.get("host", "0.0.0.0"),
+                    port=conf.get("port", 8000),
+                    path=conf.get("path", "/"),
+                    api_key=conf.get("api_key"),
+                    model=conf.get("model"),
+                    rate_limit_per_minute=conf.get(
+                        "rate_limit_per_minute"
+                    ),
                 )
-                port = src.webhook_conf.get("port", 8000)
-                path = src.webhook_conf.get("path", "/")
-                api_key = src.webhook_conf.get("api_key")
-                hmac_secret = src.webhook_conf.get(
-                    "hmac_secret"
-                )
-                model = src.webhook_conf.get("model")
-                rate_limit = src.webhook_conf.get(
-                    "rate_limit_per_minute"
-                )
-                src.start_webhook(
-                    host=host,
-                    port=port,
-                    path=path,
-                    api_key=api_key,
-                    hmac_secret=hmac_secret,
-                    model=model,
-                    rate_limit_per_minute=rate_limit,
-                )
-                if src._webhook_thread:
-                    source_threads.append(
-                        src._webhook_thread
-                    )
+                if s._webhook_thread:
+                    threads.append(s._webhook_thread)
                 continue
 
-            if src.is_async:
-
-                def target(s=src):
-                    return asyncio.run(
-                        self._run_source_async(s)
+            match s.kind:
+                case "async" | "async_gen":
+                    thr = threading.Thread(
+                        target=lambda ss=s: asyncio.run(
+                            self._run_source_async(ss)
+                        ),
+                        daemon=True,
                     )
-            else:
+                case _:
+                    thr = threading.Thread(
+                        target=lambda ss=s: self._run_source_sync(
+                            ss
+                        ),
+                        daemon=True,
+                    )
+            thr.start()
+            threads.append(thr)
 
-                def target(s=src):
-                    return self._run_source_sync(s)
-
-            thread = threading.Thread(
-                target=target, daemon=True
-            )
-            thread.start()
-            source_threads.append(thread)
-
-        # Separate non-webhook threads from webhook threads
-        non_webhook_threads = [
+        # wait non-webhook sources
+        non_webhooks = [
             th
-            for th in source_threads
-            if not (th.name.startswith("webhook-"))
+            for th in threads
+            if not th.name.startswith("webhook-")
         ]
-        webhook_present = any(
-            getattr(t, "is_webhook", False)
-            for t in self.tasks
-        )
+        for th in non_webhooks:
+            th.join()
 
-        # Wait for non-webhook source threads to complete (block until they are done)
-        for th in non_webhook_threads:
-            if th.is_alive():
-                th.join()
-
-        if webhook_present:
+        if any(t.is_webhook for t in self.tasks):
             logger.info(
-                "Webhook servers running. Press Ctrl+C to stop."
+                "Webhook(s) running. Ctrl+C to stop."
             )
             try:
-                # Keep the main thread alive until interrupted.
                 while True:
                     time.sleep(1)
             except KeyboardInterrupt:
-                logger.info(
-                    "Shutdown requested (KeyboardInterrupt). Proceeding to shutdown webhooks..."
-                )
+                logger.info("Shutdown requested")
         else:
             logger.info(
-                "Sources complete (no webhooks). Draining queues..."
+                "Sources finished; draining queues..."
             )
 
-        # Wait for all queues to empty
-        for task in self.tasks:
-            task.wait_for_queue()
+        for t in self.tasks:
+            t.wait_for_queue()
 
-        # Shutdown
-        logger.info("Processing complete. Shutting down...")
-        for task in self.tasks:
-            task.signal_stop()
-        for task in self.tasks:
-            task.stop_gracefully()
+        logger.info("Shutting down workers...")
+        for t in self.tasks:
+            t.signal_stop()
+        for t in self.tasks:
+            t.stop_gracefully()
 
-        logger.info("=" * 50)
-        logger.info("✅ Pipeline Finished.")
+        logger.info("✅ Pipeline finished")
 
 
+# -----------------------
+# decorators preserved
+# -----------------------
 def task(buffer: int = 100, workers: int = 3):
-    """
-    Decorator to create a pipeline task (sync or async)
+    def dec(fn: Callable) -> Task:
+        return Task(fn, buffer=buffer, workers=workers)
 
-    Args:
-        buffer: Max size of the input queue
-        workers: Number of worker threads to process the queue
-    """
-
-    def decorator(func: Callable) -> Task:
-        return Task(func, buffer, workers)
-
-    return decorator
+    return dec
 
 
 def webhook(
@@ -816,53 +662,24 @@ def webhook(
     port: int = 8000,
     buffer: int = 100,
     api_key: Optional[str] = None,
-    hmac_secret: Optional[str] = None,
     model: Optional[Type[BaseModel]] = None,
     rate_limit_per_minute: Optional[int] = None,
 ):
-    """
-    Decorator to create a webhook source task with optional security and validation.
-
-    Parameters:
-      - path: endpoint path (e.g. "/ingest")
-      - host, port: where to bind the server
-      - buffer: task queue size for downstream task
-      - api_key: if provided, requires header X-API-Key with this exact value
-      - hmac_secret: if provided, expects header X-Signature which is hex HMAC-SHA256(raw_body, hmac_secret)
-      - model: a pydantic BaseModel class used to validate incoming items
-      - rate_limit_per_minute: simple per-identity (IP or API key) rate limit
-
-    Usage:
-        @webhook(path="/ingest", api_key="secret", hmac_secret=b"shh", model=MyModel, rate_limit_per_minute=60)
-        def ingest(): pass
-    """
-
-    def decorator(func: Callable) -> Task:
-        t = Task(
-            func, buffer=buffer, workers=0
-        )  # webhook source: no local workers needed
+    def dec(fn: Callable) -> Task:
+        t = Task(fn, buffer=buffer, workers=0)
         t.is_webhook = True
-        # store conf to be consumed by Pipeline.run/start_webhook
         t.webhook_conf = {
             "path": path,
             "host": host,
             "port": port,
             "api_key": api_key,
-            "hmac_secret": hmac_secret,
             "model": model,
             "rate_limit_per_minute": rate_limit_per_minute,
         }
         return t
 
-    return decorator
+    return dec
 
 
-def run(pipeline: Pipeline, log_level: int = logging.INFO):
-    """
-    Convenience function to run a pipeline
-
-    Args:
-        pipeline: The Pipeline object to execute
-        log_level: Logging level (logging.DEBUG shows flow events)
-    """
-    pipeline.run(log_level=log_level)
+def run(p: Pipeline, log_level: int = logging.INFO):
+    p.run(log_level=log_level)
