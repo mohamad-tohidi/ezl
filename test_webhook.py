@@ -9,10 +9,6 @@ class DocModel(BaseModel):
     priority: str
 
 
-# secret used for HMAC
-# HMAC_SECRET = b"supersecret"
-
-
 @webhook(
     path="/ingest",
     host="127.0.0.1",
