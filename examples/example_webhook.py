@@ -1,4 +1,4 @@
-from src.ezl.core import webhook, task, run
+from ezl import webhook, task, run
 from pydantic import BaseModel
 import time
 
