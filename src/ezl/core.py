@@ -276,7 +276,7 @@ class Task:
                 if request.client
                 else "unknown"
             )
-            identity = client_ip  # rate-limiting identity
+            identity = client_ip
 
             # API key auth (optional)
             if api_key is not None:
@@ -317,34 +317,6 @@ class Task:
                         )
                     dq.append(now)
 
-            # HMAC validation (optional)
-            raw_body = await request.body()
-            if hmac_secret is not None:
-                sig_header = request.headers.get(
-                    "x-signature"
-                ) or request.headers.get("X-Signature")
-                if not sig_header:
-                    logger.flow(
-                        f"HMAC FAIL (missing header) [{self.name}]"
-                    )
-                    return JSONResponse(
-                        {"error": "Missing signature"},
-                        status_code=401,
-                    )
-                computed = hmac.new(
-                    hmac_secret, raw_body, hashlib.sha256
-                ).hexdigest()
-                if not hmac.compare_digest(
-                    computed, sig_header
-                ):
-                    logger.flow(
-                        f"HMAC FAIL (mismatch) [{self.name}]"
-                    )
-                    return JSONResponse(
-                        {"error": "Invalid signature"},
-                        status_code=401,
-                    )
-
             # Parse JSON
             try:
                 payload = await request.json()
@@ -368,8 +340,10 @@ class Task:
             rejected = 0
             if model is not None:
                 try:
-                    validated = model.parse_obj(payload)
-                    obj_to_enqueue = validated.dict()
+                    validated = model.model_validate(
+                        payload
+                    )
+                    obj_to_enqueue = validated.model_dump()
                     accepted = 1
                 except ValidationError as ve:
                     rejected = 1
@@ -392,6 +366,20 @@ class Task:
                 try:
                     self.downstream.input_queue.put(
                         obj_to_enqueue
+                    )
+
+                except queue.Full:
+                    logger.flow(
+                        f"WEBHOOK [{self.name}] queue full -> rejecting single item"
+                    )
+                    return JSONResponse(
+                        {
+                            "accepted": 0,
+                            "rejected": 1,
+                            "error": "Queue is full. Please retry after a few seconds.",
+                        },
+                        status_code=503,
+                        headers={"Retry-After": 10},
                     )
                 except Exception as e:
                     logger.error(
