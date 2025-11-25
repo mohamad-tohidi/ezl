@@ -4,9 +4,31 @@ import inspect
 import logging
 import queue
 import threading
-from typing import Callable, Any, List, Optional
+from typing import (
+    Callable,
+    Any,
+    List,
+    Optional,
+    Dict,
+    Type,
+)
+import time
+import hmac
+import hashlib
+from collections import defaultdict, deque
 
-# Setup custom log level for pipeline flow events
+# Third-party imports for webhook support (now using FastAPI)
+from fastapi import FastAPI, Request
+from fastapi.responses import (
+    JSONResponse,
+    PlainTextResponse,
+)
+import uvicorn
+from pydantic import BaseModel, ValidationError
+
+# Small compatibility: FastAPI uses Starlette under the hood for Request/Response types,
+# so our previous logic works well with FastAPI's Request.
+
 FLOW_LEVEL = 25
 logging.addLevelName(FLOW_LEVEL, "FLOW")
 
@@ -44,6 +66,16 @@ class Task:
         self.input_queue = queue.Queue(maxsize=buffer)
         self._stop_event = threading.Event()
         self._threads: List[threading.Thread] = []
+
+        # webhook attributes
+        self.is_webhook: bool = False
+        self.webhook_conf: Dict[str, Any] = {}
+        self._webhook_server: Optional[uvicorn.Server] = (
+            None
+        )
+        self._webhook_thread: Optional[threading.Thread] = (
+            None
+        )
 
     def __rshift__(self, other: "Task") -> "Pipeline":
         """Connect tasks: task1 >> task2"""
@@ -157,8 +189,21 @@ class Task:
             )
 
     def signal_stop(self):
-        """Signal worker threads to stop"""
+        """Signal worker threads to stop. Also stop webhook server (if any)"""
         self._stop_event.set()
+        if (
+            self.is_webhook
+            and self._webhook_server is not None
+        ):
+            logger.debug(
+                f"Stopping webhook server for '{self.name}'"
+            )
+            try:
+                self._webhook_server.should_exit = True
+            except Exception:
+                logger.exception(
+                    "Error while signaling webhook server to stop"
+                )
 
     def wait_for_queue(self):
         """Wait until all queued items are processed"""
@@ -166,13 +211,252 @@ class Task:
             self.input_queue.join()
 
     def stop_gracefully(self):
-        """Stop workers and wait for them to finish"""
-        if not self._threads:
+        """Stop workers and wait for them to finish. Join webhook thread if present."""
+        if not self._threads and not (
+            self.is_webhook and self._webhook_thread
+        ):
             return
         logger.debug(f"Stopping workers for '{self.name}'")
         self.signal_stop()
         for thread in self._threads:
             thread.join(timeout=2)
+
+        if self.is_webhook and self._webhook_thread:
+            self._webhook_thread.join(timeout=3)
+
+    # --------------------------
+    # webhook helpers (with auth, HMAC, validation, rate-limiting)
+    # --------------------------
+    def _make_fastapi_app(
+        self,
+        path: str,
+        *,
+        api_key: Optional[str] = None,
+        hmac_secret: Optional[bytes] = None,
+        model: Optional[Type[BaseModel]] = None,
+        rate_limit_per_minute: Optional[int] = None,
+    ):
+        """
+        Build a FastAPI app for this webhook endpoint with optional:
+          - api_key: expected value of X-API-Key header
+          - hmac_secret: bytes used to validate X-Signature (HMAC-SHA256 of raw body in hex)
+          - model: pydantic BaseModel class for payload validation
+          - rate_limit_per_minute: requests/minute per client (by IP or API key if provided)
+        """
+
+        app = FastAPI(title=f"EZL webhook: {self.name}")
+
+        # Simple in-memory sliding window rate limiter
+        window_seconds = 60
+        if (
+            rate_limit_per_minute is not None
+            and rate_limit_per_minute > 0
+        ):
+            # map key -> deque[timestamps]
+            counters: Dict[str, deque] = defaultdict(deque)
+            counters_lock = asyncio.Lock()
+        else:
+            counters = None
+            counters_lock = None
+
+        @app.post(path)
+        async def handle(request: Request):
+            # Only POST — decorator already restricts but keep this check
+            if request.method != "POST":
+                return PlainTextResponse(
+                    "Method not allowed", status_code=405
+                )
+
+            client_ip = (
+                request.client.host
+                if request.client
+                else "unknown"
+            )
+            identity = client_ip  # default identity for rate-limiting
+
+            # 1) API key auth (if configured)
+            if api_key is not None:
+                incoming = request.headers.get(
+                    "x-api-key"
+                ) or request.headers.get("X-API-Key")
+                if incoming != api_key:
+                    logger.flow(
+                        f"AUTH FAIL [{self.name}] ip={client_ip}"
+                    )
+                    return JSONResponse(
+                        {"error": "Unauthorized"},
+                        status_code=401,
+                    )
+                # use api_key as identity (so rate limits tied to key)
+                identity = f"api_key:{incoming}"
+
+            # 2) Rate limiting (simple sliding window)
+            if (
+                counters is not None
+                and counters_lock is not None
+            ):
+                now = time.time()
+                async with counters_lock:
+                    dq = counters[identity]
+                    # prune old timestamps
+                    while (
+                        dq and dq[0] <= now - window_seconds
+                    ):
+                        dq.popleft()
+                    if len(dq) >= rate_limit_per_minute:
+                        logger.flow(
+                            f"RATE LIMIT [{self.name}] id={identity} count={len(dq)}"
+                        )
+                        return JSONResponse(
+                            {
+                                "error": "Rate limit exceeded"
+                            },
+                            status_code=429,
+                        )
+                    dq.append(now)
+
+            # 3) HMAC validation (if configured). Expect header 'X-Signature' hex of hmac-sha256
+            raw_body = await request.body()
+            if hmac_secret is not None:
+                sig_header = request.headers.get(
+                    "x-signature"
+                ) or request.headers.get("X-Signature")
+                if not sig_header:
+                    logger.flow(
+                        f"HMAC FAIL (missing header) [{self.name}]"
+                    )
+                    return JSONResponse(
+                        {"error": "Missing signature"},
+                        status_code=401,
+                    )
+                computed = hmac.new(
+                    hmac_secret, raw_body, hashlib.sha256
+                ).hexdigest()
+                # Use hmac.compare_digest for timing-safe compare
+                if not hmac.compare_digest(
+                    computed, sig_header
+                ):
+                    logger.flow(
+                        f"HMAC FAIL (mismatch) [{self.name}]"
+                    )
+                    return JSONResponse(
+                        {"error": "Invalid signature"},
+                        status_code=401,
+                    )
+
+            # 4) Parse JSON (single object or array)
+            try:
+                payload = await request.json()
+            except Exception:
+                return JSONResponse(
+                    {"error": "Invalid JSON"},
+                    status_code=400,
+                )
+
+            items: List[Any] = []
+            if isinstance(payload, list):
+                items = payload
+            else:
+                items = [payload]
+
+            accepted = 0
+            rejected = 0
+            for raw_item in items:
+                # 5) Validation
+                if model is not None:
+                    try:
+                        validated = model.parse_obj(
+                            raw_item
+                        )
+                        obj_to_enqueue = validated.dict()
+                    except ValidationError as ve:
+                        rejected += 1
+                        logger.debug(
+                            f"Validation failed for item: {ve}"
+                        )
+                        continue
+                else:
+                    obj_to_enqueue = raw_item
+
+                # 6) Enqueue to downstream
+                if self.downstream:
+                    try:
+                        self.downstream.input_queue.put(
+                            obj_to_enqueue
+                        )
+                        accepted += 1
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to enqueue item for '{self.name}': {e}"
+                        )
+                else:
+                    logger.warning(
+                        f"Webhook '{self.name}' received data but no downstream is attached"
+                    )
+
+            logger.flow(
+                f"WEBHOOK [{self.name}] accepted={accepted} rejected={rejected}"
+            )
+            return JSONResponse(
+                {
+                    "accepted": accepted,
+                    "rejected": rejected,
+                },
+                status_code=202,
+            )
+
+        return app
+
+    def start_webhook(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8000,
+        path: str = "/",
+        api_key: Optional[str] = None,
+        hmac_secret: Optional[bytes] = None,
+        model: Optional[Type[BaseModel]] = None,
+        rate_limit_per_minute: Optional[int] = None,
+    ):
+        """
+        Start a uvicorn server running a FastAPI app for this task.
+        It will run in a background thread. Server will observe server.should_exit to stop.
+        """
+        if not self.is_webhook:
+            raise RuntimeError(
+                "start_webhook called on non-webhook task"
+            )
+
+        app = self._make_fastapi_app(
+            path,
+            api_key=api_key,
+            hmac_secret=hmac_secret,
+            model=model,
+            rate_limit_per_minute=rate_limit_per_minute,
+        )
+
+        config = uvicorn.Config(
+            app, host=host, port=port, log_level="info"
+        )
+        server = uvicorn.Server(config=config)
+
+        def _run_server():
+            logger.info(
+                f"Starting webhook server for '{self.name}' at http://{host}:{port}{path}"
+            )
+            server.run()
+            logger.info(
+                f"Webhook server for '{self.name}' stopped"
+            )
+
+        thread = threading.Thread(
+            target=_run_server,
+            name=f"webhook-{self.name}",
+            daemon=True,
+        )
+        thread.start()
+
+        self._webhook_server = server
+        self._webhook_thread = thread
 
 
 class Pipeline:
@@ -274,6 +558,36 @@ class Pipeline:
         source_threads = []
 
         for src in source_tasks:
+            # If the source is a webhook, start server instead of running the source function
+            if getattr(src, "is_webhook", False):
+                host = src.webhook_conf.get(
+                    "host", "0.0.0.0"
+                )
+                port = src.webhook_conf.get("port", 8000)
+                path = src.webhook_conf.get("path", "/")
+                api_key = src.webhook_conf.get("api_key")
+                hmac_secret = src.webhook_conf.get(
+                    "hmac_secret"
+                )
+                model = src.webhook_conf.get("model")
+                rate_limit = src.webhook_conf.get(
+                    "rate_limit_per_minute"
+                )
+                src.start_webhook(
+                    host=host,
+                    port=port,
+                    path=path,
+                    api_key=api_key,
+                    hmac_secret=hmac_secret,
+                    model=model,
+                    rate_limit_per_minute=rate_limit,
+                )
+                if src._webhook_thread:
+                    source_threads.append(
+                        src._webhook_thread
+                    )
+                continue
+
             if src.is_async:
 
                 def target(s=src):
@@ -291,11 +605,38 @@ class Pipeline:
             thread.start()
             source_threads.append(thread)
 
-        # Wait for sources to complete
-        for th in source_threads:
-            th.join()
+        # Separate non-webhook threads from webhook threads
+        non_webhook_threads = [
+            th
+            for th in source_threads
+            if not (th.name.startswith("webhook-"))
+        ]
+        webhook_present = any(
+            getattr(t, "is_webhook", False)
+            for t in self.tasks
+        )
 
-        logger.info("Sources complete. Draining queues...")
+        # Wait for non-webhook source threads to complete (block until they are done)
+        for th in non_webhook_threads:
+            if th.is_alive():
+                th.join()
+
+        if webhook_present:
+            logger.info(
+                "Webhook servers running. Press Ctrl+C to stop."
+            )
+            try:
+                # Keep the main thread alive until interrupted.
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                logger.info(
+                    "Shutdown requested (KeyboardInterrupt). Proceeding to shutdown webhooks..."
+                )
+        else:
+            logger.info(
+                "Sources complete (no webhooks). Draining queues..."
+            )
 
         # Wait for all queues to empty
         for task in self.tasks:
@@ -323,6 +664,53 @@ def task(buffer: int = 100, workers: int = 3):
 
     def decorator(func: Callable) -> Task:
         return Task(func, buffer, workers)
+
+    return decorator
+
+
+def webhook(
+    path: str = "/",
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    buffer: int = 100,
+    api_key: Optional[str] = None,
+    hmac_secret: Optional[str] = None,
+    model: Optional[Type[BaseModel]] = None,
+    rate_limit_per_minute: Optional[int] = None,
+):
+    """
+    Decorator to create a webhook source task with optional security and validation.
+
+    Parameters:
+      - path: endpoint path (e.g. "/ingest")
+      - host, port: where to bind the server
+      - buffer: task queue size for downstream task
+      - api_key: if provided, requires header X-API-Key with this exact value
+      - hmac_secret: if provided, expects header X-Signature which is hex HMAC-SHA256(raw_body, hmac_secret)
+      - model: a pydantic BaseModel class used to validate incoming items
+      - rate_limit_per_minute: simple per-identity (IP or API key) rate limit
+
+    Usage:
+        @webhook(path="/ingest", api_key="secret", hmac_secret=b"shh", model=MyModel, rate_limit_per_minute=60)
+        def ingest(): pass
+    """
+
+    def decorator(func: Callable) -> Task:
+        t = Task(
+            func, buffer=buffer, workers=0
+        )  # webhook source: no local workers needed
+        t.is_webhook = True
+        # store conf to be consumed by Pipeline.run/start_webhook
+        t.webhook_conf = {
+            "path": path,
+            "host": host,
+            "port": port,
+            "api_key": api_key,
+            "hmac_secret": hmac_secret,
+            "model": model,
+            "rate_limit_per_minute": rate_limit_per_minute,
+        }
+        return t
 
     return decorator
 
