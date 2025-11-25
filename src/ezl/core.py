@@ -16,8 +16,6 @@ import time
 import hmac
 import hashlib
 from collections import defaultdict, deque
-
-# Third-party imports for webhook support (now using FastAPI)
 from fastapi import FastAPI, Request
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import (
@@ -25,7 +23,10 @@ from fastapi.responses import (
     PlainTextResponse,
 )
 import uvicorn
-from pydantic import BaseModel, ValidationError
+from pydantic import (
+    BaseModel,
+    ValidationError,
+)
 
 # Small compatibility: FastAPI uses Starlette under the hood for Request/Response types,
 # so our previous logic works well with FastAPI's Request.
@@ -238,16 +239,11 @@ class Task:
         rate_limit_per_minute: Optional[int] = None,
     ):
         """
-        Build a FastAPI app for this webhook endpoint with optional:
-        - api_key: expected value of X-API-Key header
-        - hmac_secret: bytes used to validate X-Signature (HMAC-SHA256 of raw body in hex)
-        - model: pydantic BaseModel class for payload validation
-        - rate_limit_per_minute: requests/minute per client (by IP or API key if provided)
-
-        This also injects an OpenAPI requestBody schema derived from `model`
-        so /docs and /redoc show the model fields.
+        Build a FastAPI app for this webhook endpoint, optionally creating:
+        - single-item POST at `path`
+        - typed `/batch` POST at `path + "/batch"` when `model` is provided
+        The `/batch` route is annotated with List[model] so OpenAPI shows fields clearly.
         """
-
         app = FastAPI(title=f"EZL webhook: {self.name}")
 
         # Simple in-memory sliding window rate limiter
@@ -256,16 +252,20 @@ class Task:
             rate_limit_per_minute is not None
             and rate_limit_per_minute > 0
         ):
-            # map key -> deque[timestamps]
             counters: Dict[str, deque] = defaultdict(deque)
             counters_lock = asyncio.Lock()
         else:
             counters = None
             counters_lock = None
 
-        @app.post(path)
-        async def handle(request: Request):
-            # Only POST — decorator already restricts but keep this check
+        # -----------------------
+        # Single-item endpoint
+        # -----------------------
+        @app.post(
+            path, summary="Ingest single webhook item"
+        )
+        async def handle_single(request: Request):
+            # Only POST — keep the check for safety
             if request.method != "POST":
                 return PlainTextResponse(
                     "Method not allowed", status_code=405
@@ -276,9 +276,9 @@ class Task:
                 if request.client
                 else "unknown"
             )
-            identity = client_ip  # default identity for rate-limiting
+            identity = client_ip  # rate-limiting identity
 
-            # 1) API key auth (if configured)
+            # API key auth (optional)
             if api_key is not None:
                 incoming = request.headers.get(
                     "x-api-key"
@@ -291,10 +291,9 @@ class Task:
                         {"error": "Unauthorized"},
                         status_code=401,
                     )
-                # use api_key as identity (so rate limits tied to key)
                 identity = f"api_key:{incoming}"
 
-            # 2) Rate limiting (simple sliding window)
+            # Rate limiting (optional)
             if (
                 counters is not None
                 and counters_lock is not None
@@ -302,7 +301,6 @@ class Task:
                 now = time.time()
                 async with counters_lock:
                     dq = counters[identity]
-                    # prune old timestamps
                     while (
                         dq and dq[0] <= now - window_seconds
                     ):
@@ -319,7 +317,7 @@ class Task:
                         )
                     dq.append(now)
 
-            # 3) HMAC validation (if configured). Expect header 'X-Signature' hex of hmac-sha256
+            # HMAC validation (optional)
             raw_body = await request.body()
             if hmac_secret is not None:
                 sig_header = request.headers.get(
@@ -336,7 +334,6 @@ class Task:
                 computed = hmac.new(
                     hmac_secret, raw_body, hashlib.sha256
                 ).hexdigest()
-                # Use hmac.compare_digest for timing-safe compare
                 if not hmac.compare_digest(
                     computed, sig_header
                 ):
@@ -348,7 +345,7 @@ class Task:
                         status_code=401,
                     )
 
-            # 4) Parse JSON (single object or array)
+            # Parse JSON
             try:
                 payload = await request.json()
             except Exception:
@@ -357,46 +354,57 @@ class Task:
                     status_code=400,
                 )
 
-            items: List[Any] = []
+            # If array -> instruct to use /batch
             if isinstance(payload, list):
-                items = payload
-            else:
-                items = [payload]
+                return JSONResponse(
+                    {
+                        "error": "Batch payloads should be POSTed to the /batch endpoint"
+                    },
+                    status_code=400,
+                )
 
+            # Validate single item (if model provided)
             accepted = 0
             rejected = 0
-            for raw_item in items:
-                # 5) Validation
-                if model is not None:
-                    try:
-                        validated = model.parse_obj(
-                            raw_item
-                        )
-                        obj_to_enqueue = validated.dict()
-                    except ValidationError as ve:
-                        rejected += 1
-                        logger.debug(
-                            f"Validation failed for item: {ve}"
-                        )
-                        continue
-                else:
-                    obj_to_enqueue = raw_item
-
-                # 6) Enqueue to downstream
-                if self.downstream:
-                    try:
-                        self.downstream.input_queue.put(
-                            obj_to_enqueue
-                        )
-                        accepted += 1
-                    except Exception as e:
-                        logger.error(
-                            f"Failed to enqueue item for '{self.name}': {e}"
-                        )
-                else:
-                    logger.warning(
-                        f"Webhook '{self.name}' received data but no downstream is attached"
+            if model is not None:
+                try:
+                    validated = model.parse_obj(payload)
+                    obj_to_enqueue = validated.dict()
+                    accepted = 1
+                except ValidationError as ve:
+                    rejected = 1
+                    logger.debug(
+                        f"Validation failed for item: {ve}"
                     )
+                    return JSONResponse(
+                        {
+                            "accepted": accepted,
+                            "rejected": rejected,
+                        },
+                        status_code=422,
+                    )
+            else:
+                obj_to_enqueue = payload
+                accepted = 1
+
+            # Enqueue
+            if self.downstream:
+                try:
+                    self.downstream.input_queue.put(
+                        obj_to_enqueue
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to enqueue item for '{self.name}': {e}"
+                    )
+                    return JSONResponse(
+                        {"error": "Failed to enqueue"},
+                        status_code=500,
+                    )
+            else:
+                logger.warning(
+                    f"Webhook '{self.name}' received data but no downstream is attached"
+                )
 
             logger.flow(
                 f"WEBHOOK [{self.name}] accepted={accepted} rejected={rejected}"
@@ -409,59 +417,106 @@ class Task:
                 status_code=202,
             )
 
-        # If a pydantic model was provided, patch the app.openapi generator
+        # -----------------------
+        # Batch endpoint (typed) - only add if a pydantic model is provided
+        # -----------------------
         if model is not None:
-            # preserve original get_openapi usage and add our requestBody
+            # create route path for batch (ensure no double-slash)
+            batch_path = path.rstrip("/") + "/batch"
+
+            async def handle_batch(
+                items: list[model],  # type: ignore
+            ):
+                """
+                Accepts a JSON array of items matching the provided pydantic model.
+                This function body will run after FastAPI has validated & parsed items into model instances.
+                """
+                accepted = 0
+                rejected = 0
+                for inst in items:
+                    try:
+                        # inst is a model instance (validated)
+                        obj_to_enqueue = inst.dict()
+                        if self.downstream:
+                            self.downstream.input_queue.put(
+                                obj_to_enqueue
+                            )
+                            accepted += 1
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to enqueue item for '{self.name}': {e}"
+                        )
+                        rejected += 1
+
+                logger.flow(
+                    f"WEBHOOK [{self.name}] batch accepted={accepted} rejected={rejected}"
+                )
+                return JSONResponse(
+                    {
+                        "accepted": accepted,
+                        "rejected": rejected,
+                    },
+                    status_code=202,
+                )
+
+            # Register the batch route. We give it an explicit summary so docs look nice.
+            app.post(
+                batch_path, summary="Ingest batch of items"
+            )(handle_batch)
+
             def custom_openapi():
                 if app.openapi_schema:
                     return app.openapi_schema
-                # build base schema
                 openapi_schema = get_openapi(
                     title=app.title,
                     version="1.0.0",
                     routes=app.routes,
                 )
-
-                # Ensure model schema is present in components/schemas
+                # ensure model schema is in components
                 try:
-                    model_schema = model.schema(
+                    model_schema = model.model_json_schema(
                         ref_template="#/components/schemas/{model}"
                     )
                 except Exception:
-                    # fallback to parse via schema_json or simple wrapper
-                    model_schema = model.schema()
+                    model_schema = model.model_json_schema()
 
                 comp = openapi_schema.setdefault(
                     "components", {}
                 ).setdefault("schemas", {})
-                # model.schema() returns top-level mapping; use model.__name__ as key
                 comp.setdefault(
                     model.__name__, model_schema
                 )
 
-                # inject requestBody for the POST operation on `path`
-                # the path in openapi uses the raw path as provided (e.g. "/ingest")
                 path_item = openapi_schema.get(
                     "paths", {}
                 ).get(path)
                 if path_item and "post" in path_item:
                     post_op = path_item["post"]
-                    # create a schema that accepts either a single object OR an array of objects:
                     post_op["requestBody"] = {
                         "content": {
                             "application/json": {
                                 "schema": {
-                                    "oneOf": [
-                                        {
-                                            "$ref": f"#/components/schemas/{model.__name__}"
-                                        },
-                                        {
-                                            "type": "array",
-                                            "items": {
-                                                "$ref": f"#/components/schemas/{model.__name__}"
-                                            },
-                                        },
-                                    ]
+                                    "$ref": f"#/components/schemas/{model.__name__}"
+                                }
+                            }
+                        },
+                        "required": True,
+                    }
+
+                # For batch path: requestBody -> array of model
+                batch_item = openapi_schema.get(
+                    "paths", {}
+                ).get(batch_path)
+                if batch_item and "post" in batch_item:
+                    post_op = batch_item["post"]
+                    post_op["requestBody"] = {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {
+                                        "$ref": f"#/components/schemas/{model.__name__}"
+                                    },
                                 }
                             }
                         },
@@ -472,6 +527,20 @@ class Task:
                 return app.openapi_schema
 
             app.openapi = custom_openapi
+        else:
+            # If no model provided, we still supply a default openapi so docs show the route exists
+            def custom_openapi_no_model():
+                if app.openapi_schema:
+                    return app.openapi_schema
+                openapi_schema = get_openapi(
+                    title=app.title,
+                    version="1.0.0",
+                    routes=app.routes,
+                )
+                app.openapi_schema = openapi_schema
+                return app.openapi_schema
+
+            app.openapi = custom_openapi_no_model
 
         return app
 
