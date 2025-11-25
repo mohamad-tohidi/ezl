@@ -1,8 +1,8 @@
-Below is a **concise, structured, easy-to-read README** for the `ezl` library.
-
----
 
 # **ezl — Extremely Small Pipeline Library**
+
+Easy ETL -> EZL
+
 
 `ezl` is a tiny, opinionated pipeline engine built around **Tasks**, **queues**, and optional **webhook ingestion**.
 It focuses on **simplicity**, **predictable backpressure**, and **minimal Developer Experience**.
