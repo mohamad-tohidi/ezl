@@ -19,6 +19,7 @@ from collections import defaultdict, deque
 
 # Third-party imports for webhook support (now using FastAPI)
 from fastapi import FastAPI, Request
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import (
     JSONResponse,
     PlainTextResponse,
@@ -238,10 +239,13 @@ class Task:
     ):
         """
         Build a FastAPI app for this webhook endpoint with optional:
-          - api_key: expected value of X-API-Key header
-          - hmac_secret: bytes used to validate X-Signature (HMAC-SHA256 of raw body in hex)
-          - model: pydantic BaseModel class for payload validation
-          - rate_limit_per_minute: requests/minute per client (by IP or API key if provided)
+        - api_key: expected value of X-API-Key header
+        - hmac_secret: bytes used to validate X-Signature (HMAC-SHA256 of raw body in hex)
+        - model: pydantic BaseModel class for payload validation
+        - rate_limit_per_minute: requests/minute per client (by IP or API key if provided)
+
+        This also injects an OpenAPI requestBody schema derived from `model`
+        so /docs and /redoc show the model fields.
         """
 
         app = FastAPI(title=f"EZL webhook: {self.name}")
@@ -404,6 +408,70 @@ class Task:
                 },
                 status_code=202,
             )
+
+        # If a pydantic model was provided, patch the app.openapi generator
+        if model is not None:
+            # preserve original get_openapi usage and add our requestBody
+            def custom_openapi():
+                if app.openapi_schema:
+                    return app.openapi_schema
+                # build base schema
+                openapi_schema = get_openapi(
+                    title=app.title,
+                    version="1.0.0",
+                    routes=app.routes,
+                )
+
+                # Ensure model schema is present in components/schemas
+                try:
+                    model_schema = model.schema(
+                        ref_template="#/components/schemas/{model}"
+                    )
+                except Exception:
+                    # fallback to parse via schema_json or simple wrapper
+                    model_schema = model.schema()
+
+                comp = openapi_schema.setdefault(
+                    "components", {}
+                ).setdefault("schemas", {})
+                # model.schema() returns top-level mapping; use model.__name__ as key
+                comp.setdefault(
+                    model.__name__, model_schema
+                )
+
+                # inject requestBody for the POST operation on `path`
+                # the path in openapi uses the raw path as provided (e.g. "/ingest")
+                path_item = openapi_schema.get(
+                    "paths", {}
+                ).get(path)
+                if path_item and "post" in path_item:
+                    post_op = path_item["post"]
+                    # create a schema that accepts either a single object OR an array of objects:
+                    post_op["requestBody"] = {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "oneOf": [
+                                        {
+                                            "$ref": f"#/components/schemas/{model.__name__}"
+                                        },
+                                        {
+                                            "type": "array",
+                                            "items": {
+                                                "$ref": f"#/components/schemas/{model.__name__}"
+                                            },
+                                        },
+                                    ]
+                                }
+                            }
+                        },
+                        "required": True,
+                    }
+
+                app.openapi_schema = openapi_schema
+                return app.openapi_schema
+
+            app.openapi = custom_openapi
 
         return app
 
