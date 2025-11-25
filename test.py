@@ -5,16 +5,12 @@ processed_values = []
 total_processed = 0
 
 
-@task(
-    buffer=10000, workers=1
-)  # Source task: single worker, large buffer
+@task(buffer=10000, workers=1)
 async def extract():
     """Extract: Generate 10,000 sequential numbers for verifiable processing"""
     print("🔍 Extracting 10,000 numbers...")
     for i in range(10000):
-        await asyncio.sleep(
-            0.001
-        )  # Minimal delay to simulate work without slowing too much
+        await asyncio.sleep(0.001)
         yield {
             "id": f"num_{i}",
             "value": i,
@@ -22,14 +18,10 @@ async def extract():
     print("✅ Extraction complete.")
 
 
-@task(
-    buffer=10000, workers=20
-)  # Transform: High concurrency, large buffer
+@task(buffer=10000, workers=20)
 async def transform(item):
     """Transform: Double the value (simple verifiable operation, 1:1 mapping)"""
-    await asyncio.sleep(
-        0.005
-    )  # Simulate some CPU-intensive work
+    await asyncio.sleep(0.005)
     doubled_value = item["value"] * 2
     yield {
         "id": item["id"],
@@ -38,15 +30,11 @@ async def transform(item):
     }
 
 
-@task(
-    buffer=5000, workers=1
-)  # Load: Moderate concurrency, large buffer
+@task(buffer=5000, workers=1)
 async def load(item):
     """Load: Collect transformed values for verification"""
     global total_processed
-    await asyncio.sleep(
-        0.002
-    )  # Simulate I/O or insertion delay
+    await asyncio.sleep(0.002)
     processed_values.append(item["value"])
     total_processed += 1
     if total_processed % 1000 == 0:
@@ -77,7 +65,7 @@ if __name__ == "__main__":
     print("- Expected sum of processed values: 99,990,000")
     print("=" * 60)
 
-    run()
+    run(p=pipeline)
 
     # Verification after pipeline completes
     actual_count = len(processed_values)

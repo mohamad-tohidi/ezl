@@ -1,12 +1,12 @@
-from ezl import task, run
-import asyncio
+from src.ezl import task, run
 import random
+import asyncio
 
 
-@task(buffer=100, workers=10)
-async def somthing_else():
-    """Extract: Pull data from source"""
-    print("🔍 Extracting 50 documents...")
+@task(buffer=100, workers=3)
+async def extract():
+    """Extract: Async data fetch"""
+    print("🔍 Extracting 50 documents (async)...")
     for i in range(50):
         await asyncio.sleep(0.05)
         yield {
@@ -17,10 +17,11 @@ async def somthing_else():
 
 
 @task(buffer=100, workers=3)
-async def transform(item):
-    """Transform: Process data (generates 2-3 chunks per doc)"""
-    await asyncio.sleep(0.1)  # Simulate CPU work
+def transform(item):
+    """Transform: CPU-bound processing (sync)"""
+    import time
 
+    time.sleep(0.01)
     for j in range(random.randint(2, 3)):
         yield {
             "id": f"{item['id']}_chunk_{j}",
@@ -29,17 +30,18 @@ async def transform(item):
         }
 
 
-@task(buffer=50, workers=2)
+@task(buffer=0, workers=2)
 async def load(item):
-    """Load: Insert into target"""
-    await asyncio.sleep(0.05)
+    """Load: Async database insertion"""
+    await asyncio.sleep(0.05)  # async I/O
+    # await async_db.insert(item)
 
 
 # ========================================
 # 2. BUILD PIPELINE
 # ========================================
 
-pipeline = somthing_else >> transform >> load
+pipeline = extract >> transform >> load
 
 # ========================================
 # 3. RUN
@@ -48,4 +50,4 @@ pipeline = somthing_else >> transform >> load
 if __name__ == "__main__":
     print("🚀 ETL Pipeline Starting...")
     print("=" * 50)
-    run()
+    run(pipeline)
