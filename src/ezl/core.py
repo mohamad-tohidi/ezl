@@ -430,6 +430,23 @@ class Task:
                                 obj_to_enqueue
                             )
                             accepted += 1
+
+                    except queue.Full:
+                        # downstream is full; ask client to retry after a short pause
+                        logger.flow(
+                            f"WEBHOOK [{self.name}] queue full during batch -> accepted={accepted}"
+                        )
+                        return JSONResponse(
+                            {
+                                "accepted": accepted,
+                                "rejected": len(items)
+                                - accepted,
+                                "error": "Queue is full. Some items were accepted; please retry remaining items after a few seconds.",
+                            },
+                            status_code=503,
+                            headers={"Retry-After": 10},
+                        )
+
                     except Exception as e:
                         logger.error(
                             f"Failed to enqueue item for '{self.name}': {e}"
