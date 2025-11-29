@@ -96,6 +96,11 @@ class Task:
             return NotImplemented
         return Pipeline(self, other)
 
+    def __or__(self, other: "Task"):
+        if not isinstance(other, Task):
+            return NotImplemented
+        return ChoiceTask(self, other, condition=None)
+
     # -------------------------
     # worker lifecycle
     # -------------------------
@@ -125,6 +130,8 @@ class Task:
             match self.kind:
                 case "async" | "async_gen":
                     asyncio.run(self._async_worker())
+                case "choice":
+                    asyncio.run(self._choice_worker())
                 case _:
                     self._sync_worker()
         finally:
@@ -194,6 +201,61 @@ class Task:
                 except Exception:
                     logger.exception(
                         f"Error in async '{self.name}'"
+                    )
+                finally:
+                    self.input_queue.task_done()
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+                continue
+
+    async def _choice_worker(self):
+        while not self._stop.is_set():
+            try:
+                item = self.input_queue.get(timeout=0.5)
+                logger.flow(f"PULL [{self.name}]")
+                try:
+                    if self.condition is None:
+                        raise ValueError(
+                            f"Condition not set for choice task '{self.name}'"
+                        )
+                    use_left = self.condition(item)
+                    branch = (
+                        self.left
+                        if use_left
+                        else self.right
+                    )
+                    branch_name = branch.name
+                    match branch.kind:
+                        case "sync_gen":
+                            for out in branch.func(item):
+                                logger.flow(
+                                    f"PROC [{self.name}:{branch_name}]"
+                                )
+                                self._send_downstream(out)
+                        case "sync":
+                            out = branch.func(item)
+                            if out is not None:
+                                logger.flow(
+                                    f"PROC [{self.name}:{branch_name}]"
+                                )
+                                self._send_downstream(out)
+                        case "async_gen":
+                            agen = branch.func(item)
+                            async for out in agen:
+                                logger.flow(
+                                    f"PROC [{self.name}:{branch_name}]"
+                                )
+                                self._send_downstream(out)
+                        case "async":
+                            out = await branch.func(item)
+                            if out is not None:
+                                logger.flow(
+                                    f"PROC [{self.name}:{branch_name}]"
+                                )
+                                self._send_downstream(out)
+                except Exception:
+                    logger.exception(
+                        f"Error in choice '{self.name}'"
                     )
                 finally:
                     self.input_queue.task_done()
@@ -517,6 +579,38 @@ class Task:
         self._webhook_thread = thr
 
 
+class ChoiceTask(Task):
+    def __init__(
+        self,
+        left: Task,
+        right: Task,
+        condition: Optional[Callable],
+    ):
+        buffer = max(left.buffer, right.buffer)
+        workers = max(left.workers, right.workers)
+        super().__init__(
+            func=None, buffer=buffer, workers=workers
+        )
+        self.kind = "choice"
+        self.left = left
+        self.right = right
+        self.condition = condition
+        self.name = f"choice({left.name}|{right.name})"
+
+    def __xor__(self, other: Callable):
+        if not callable(other):
+            raise TypeError(
+                "^ expects a callable condition"
+            )
+        self.condition = other
+        return self
+
+    def __or__(self, other: "Task"):
+        if not isinstance(other, Task):
+            return NotImplemented
+        return ChoiceTask(self, other, condition=None)
+
+
 class Pipeline:
     """Tiny pipeline container and runner using match/case."""
 
@@ -527,7 +621,7 @@ class Pipeline:
         self.source = a
         self.sink = b
 
-    def __rshift__(self, other: Task):
+    def __rshift__(self, other: "Task"):
         if not isinstance(other, Task):
             return NotImplemented
         self.sink.downstream = other
@@ -535,6 +629,14 @@ class Pipeline:
         self.tasks.append(other)
         self.sink = other
         return self
+
+    def __or__(self, other: "Task"):
+        return self.sink.__or__(other)
+
+    def __xor__(self, other: Callable):
+        if isinstance(self.sink, ChoiceTask):
+            return self.sink.__xor__(other)
+        raise TypeError("^ can only be used after |")
 
     def _run_source_sync(self, src: Task):
         logger.info(f"Running source '{src.name}' (sync)")
