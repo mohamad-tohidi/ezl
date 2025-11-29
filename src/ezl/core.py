@@ -41,6 +41,14 @@ logging.Logger.flow = _flow
 logger = logging.getLogger(__name__)
 
 
+def get_item_key(item: Any, key: str) -> str:
+    keys = key.split(".")
+    val = item
+    for k in keys:
+        val = val[k]
+    return str(val)
+
+
 class Task:
     """A node in the pipeline. Uses match/case for clarity."""
 
@@ -76,6 +84,12 @@ class Task:
         self._webhook_thread: Optional[threading.Thread] = (
             None
         )
+
+        # collector-related
+        self.is_collector = False
+        self.log_file: Optional[str] = None
+        self.log_key: Optional[str] = None
+        self.filter_key: Optional[str] = None
 
     def __rshift__(self, other: "Task"):
         if not isinstance(other, Task):
@@ -560,13 +574,76 @@ class Pipeline:
                 f"Async source '{src.name}' failed"
             )
 
-    def run(self, log_level: int = logging.INFO):
+    def run(
+        self,
+        log_level: int = logging.INFO,
+        resume: bool = False,
+    ):
         logging.basicConfig(
             level=log_level,
             format="%(levelname)-8s | %(message)s",
         )
         logger.setLevel(log_level)
         logger.info("🚀 Pipeline starting")
+
+        if resume and self.sink.is_collector:
+            processed = set()
+            try:
+                with open(self.sink.log_file, "r") as f:
+                    for line in f:
+                        processed.add(line.strip())
+            except FileNotFoundError:
+                pass
+
+            original_func = self.source.func
+            kind = self.source.kind
+            filter_key = self.sink.filter_key
+
+            def get_key(item):
+                return get_item_key(item, filter_key)
+
+            if kind == "sync_gen":
+
+                def wrapped():
+                    for item in original_func():
+                        if get_key(item) in processed:
+                            continue
+                        yield item
+
+                self.source.func = wrapped
+            elif kind == "async_gen":
+
+                async def wrapped():
+                    async for item in original_func():
+                        if get_key(item) in processed:
+                            continue
+                        yield item
+
+                self.source.func = wrapped
+            elif kind == "sync":
+
+                def wrapped():
+                    item = original_func()
+                    if (
+                        item is not None
+                        and get_key(item) in processed
+                    ):
+                        return None
+                    return item
+
+                self.source.func = wrapped
+            elif kind == "async":
+
+                async def wrapped():
+                    item = await original_func()
+                    if (
+                        item is not None
+                        and get_key(item) in processed
+                    ):
+                        return None
+                    return item
+
+                self.source.func = wrapped
 
         for t in self.tasks:
             t.start_workers()
@@ -681,5 +758,29 @@ def webhook(
     return dec
 
 
-def run(p: Pipeline, log_level: int = logging.INFO):
-    p.run(log_level=log_level)
+def collector(
+    log_file: str,
+    key: str = "id",
+    filter_key: Optional[str] = None,
+    buffer: int = 100,
+    workers: int = 1,
+):
+    def log_func(item):
+        val = get_item_key(item, key)
+        with open(log_file, "a") as f:
+            f.write(val + "\n")
+
+    t = Task(log_func, buffer=buffer, workers=workers)
+    t.is_collector = True
+    t.log_file = log_file
+    t.log_key = key
+    t.filter_key = filter_key or key
+    return t
+
+
+def run(
+    p: Pipeline,
+    log_level: int = logging.INFO,
+    resume: bool = False,
+):
+    p.run(log_level=log_level, resume=resume)
