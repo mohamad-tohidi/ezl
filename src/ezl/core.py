@@ -17,6 +17,11 @@ import threading
 import time
 from collections import defaultdict, deque
 from typing import Any, Callable, Dict, List, Optional, Type
+from multiprocessing import (
+    Process,
+    Queue as MPQueue,
+    Event as MPEvent,
+)
 
 from fastapi import FastAPI, Request
 from fastapi.openapi.utils import get_openapi
@@ -40,6 +45,8 @@ def _flow(self, msg, *a, **k):
 logging.Logger.flow = _flow
 logger = logging.getLogger(__name__)
 
+SENTINEL = object()
+
 
 class Task:
     """A node in the pipeline. Uses match/case for clarity."""
@@ -53,11 +60,13 @@ class Task:
         self.workers = max(0, workers)
         self.upstream: List["Task"] = []
         self.downstream: Optional["Task"] = None
-        self.input_queue: queue.Queue = queue.Queue(
+        self.input_queue: MPQueue = MPQueue(
             maxsize=self.buffer
         )
-        self._stop = threading.Event()
+        self._stop = MPEvent()
         self._threads: List[threading.Thread] = []
+        self._sentinels_received: int = 0
+        self._sentinel_lock = threading.Lock()
 
         # classify function kind once
         if inspect.isasyncgenfunction(func):
@@ -76,6 +85,7 @@ class Task:
         self._webhook_thread: Optional[threading.Thread] = (
             None
         )
+        self._process = None
 
     def __rshift__(self, other: "Task"):
         if not isinstance(other, Task):
@@ -123,6 +133,15 @@ class Task:
             try:
                 item = self.input_queue.get(timeout=0.5)
                 logger.flow(f"PULL [{self.name}]")
+                if item is SENTINEL:
+                    with self._sentinel_lock:
+                        self._sentinels_received += 1
+                        if self._sentinels_received == len(
+                            self.upstream
+                        ):
+                            self._send_sentinel_downstream()
+                            self._stop.set()
+                    continue
                 try:
                     match self.kind:
                         case "sync_gen":
@@ -147,8 +166,6 @@ class Task:
                     logger.exception(
                         f"Error in '{self.name}'"
                     )
-                finally:
-                    self.input_queue.task_done()
             except queue.Empty:
                 continue
 
@@ -157,6 +174,15 @@ class Task:
             try:
                 item = self.input_queue.get(timeout=0.5)
                 logger.flow(f"PULL [{self.name}]")
+                if item is SENTINEL:
+                    with self._sentinel_lock:
+                        self._sentinels_received += 1
+                        if self._sentinels_received == len(
+                            self.upstream
+                        ):
+                            self._send_sentinel_downstream()
+                            self._stop.set()
+                    continue
                 try:
                     match self.kind:
                         case "async_gen":
@@ -181,8 +207,6 @@ class Task:
                     logger.exception(
                         f"Error in async '{self.name}'"
                     )
-                finally:
-                    self.input_queue.task_done()
             except queue.Empty:
                 await asyncio.sleep(0.01)
                 continue
@@ -206,29 +230,98 @@ class Task:
                 f"Failed to put into downstream '{self.downstream.name}'"
             )
 
-    def wait_for_queue(self):
-        if self.upstream:
-            self.input_queue.join()
+    def _send_sentinel_downstream(self):
+        if self.downstream:
+            self.downstream.input_queue.put(SENTINEL)
 
     def signal_stop(self):
         self._stop.set()
-        if (
-            self.is_webhook
-            and self._webhook_server is not None
-        ):
-            try:
-                self._webhook_server.should_exit = True
-            except Exception:
-                logger.exception(
-                    "Error stopping webhook server"
-                )
 
-    def stop_gracefully(self):
-        self.signal_stop()
-        for t in self._threads:
-            t.join(timeout=2)
-        if self.is_webhook and self._webhook_thread:
-            self._webhook_thread.join(timeout=3)
+    def run_source_sync(self):
+        logger.info(f"Running source '{self.name}' (sync)")
+        try:
+            match self.kind:
+                case "sync_gen":
+                    for it in self.func():
+                        self._send_downstream(it)
+                case "sync":
+                    out = self.func()
+                    if out is not None:
+                        self._send_downstream(out)
+                case _:
+                    logger.error(
+                        f"Unexpected source kind: {self.kind}"
+                    )
+        except Exception:
+            logger.exception(f"Source '{self.name}' failed")
+        finally:
+            self._send_sentinel_downstream()
+
+    async def run_source_async(self):
+        logger.info(f"Running source '{self.name}' (async)")
+        try:
+            match self.kind:
+                case "async_gen":
+                    async for it in self.func():
+                        self._send_downstream(it)
+                case "async":
+                    out = await self.func()
+                    if out is not None:
+                        self._send_downstream(out)
+                case _:
+                    logger.error(
+                        f"Unexpected async source kind: {self.kind}"
+                    )
+        except Exception:
+            logger.exception(
+                f"Async source '{self.name}' failed"
+            )
+        finally:
+            self._send_sentinel_downstream()
+
+    def run_in_process(self):
+        try:
+            if self.is_webhook:
+                self.start_webhook(
+                    host=self.webhook_conf.get(
+                        "host", "0.0.0.0"
+                    ),
+                    port=self.webhook_conf.get(
+                        "port", 8000
+                    ),
+                    path=self.webhook_conf.get("path", "/"),
+                    api_key=self.webhook_conf.get(
+                        "api_key"
+                    ),
+                    model=self.webhook_conf.get("model"),
+                    rate_limit_per_minute=self.webhook_conf.get(
+                        "rate_limit_per_minute"
+                    ),
+                )
+                while not self._stop.is_set():
+                    time.sleep(0.1)
+                if self._webhook_server is not None:
+                    self._webhook_server.should_exit = True
+                if self._webhook_thread:
+                    self._webhook_thread.join(timeout=3)
+                self._send_sentinel_downstream()
+            elif not self.upstream:
+                if self.kind in ["async", "async_gen"]:
+                    asyncio.run(self.run_source_async())
+                else:
+                    self.run_source_sync()
+            else:
+                self.start_workers()
+                while not self._stop.is_set():
+                    time.sleep(0.1)
+        except Exception:
+            logger.exception(
+                f"Process for '{self.name}' failed"
+            )
+        finally:
+            logger.info(
+                f"Process for '{self.name}' exiting"
+            )
 
     # -------------------------
     # webhook + OpenAPI
@@ -522,44 +615,6 @@ class Pipeline:
         self.sink = other
         return self
 
-    def _run_source_sync(self, src: Task):
-        logger.info(f"Running source '{src.name}' (sync)")
-        try:
-            match src.kind:
-                case "sync_gen":
-                    for it in src.func():
-                        src._send_downstream(it)
-                case "sync":
-                    out = src.func()
-                    if out is not None:
-                        src._send_downstream(out)
-                case _:
-                    logger.error(
-                        f"Unexpected source kind: {src.kind}"
-                    )
-        except Exception:
-            logger.exception(f"Source '{src.name}' failed")
-
-    async def _run_source_async(self, src: Task):
-        logger.info(f"Running source '{src.name}' (async)")
-        try:
-            match src.kind:
-                case "async_gen":
-                    async for it in src.func():
-                        src._send_downstream(it)
-                case "async":
-                    out = await src.func()
-                    if out is not None:
-                        src._send_downstream(out)
-                case _:
-                    logger.error(
-                        f"Unexpected async source kind: {src.kind}"
-                    )
-        except Exception:
-            logger.exception(
-                f"Async source '{src.name}' failed"
-            )
-
     def run(self, log_level: int = logging.INFO):
         logging.basicConfig(
             level=log_level,
@@ -568,59 +623,32 @@ class Pipeline:
         logger.setLevel(log_level)
         logger.info("🚀 Pipeline starting")
 
+        procs = []
         for t in self.tasks:
-            t.start_workers()
+            p = Process(
+                target=t.run_in_process, daemon=True
+            )
+            p.start()
+            procs.append(p)
+            t._process = p
 
         source_tasks = [
             t for t in self.tasks if not t.upstream
         ]
-        threads: List[threading.Thread] = []
-
-        for s in source_tasks:
-            if getattr(s, "is_webhook", False):
-                conf = s.webhook_conf
-                s.start_webhook(
-                    host=conf.get("host", "0.0.0.0"),
-                    port=conf.get("port", 8000),
-                    path=conf.get("path", "/"),
-                    api_key=conf.get("api_key"),
-                    model=conf.get("model"),
-                    rate_limit_per_minute=conf.get(
-                        "rate_limit_per_minute"
-                    ),
-                )
-                if s._webhook_thread:
-                    threads.append(s._webhook_thread)
-                continue
-
-            match s.kind:
-                case "async" | "async_gen":
-                    thr = threading.Thread(
-                        target=lambda ss=s: asyncio.run(
-                            self._run_source_async(ss)
-                        ),
-                        daemon=True,
-                    )
-                case _:
-                    thr = threading.Thread(
-                        target=lambda ss=s: self._run_source_sync(
-                            ss
-                        ),
-                        daemon=True,
-                    )
-            thr.start()
-            threads.append(thr)
-
-        # wait non-webhook sources
-        non_webhooks = [
-            th
-            for th in threads
-            if not th.name.startswith("webhook-")
+        non_webhook_sources = [
+            t for t in source_tasks if not t.is_webhook
         ]
-        for th in non_webhooks:
-            th.join()
+        non_webhook_source_procs = [
+            t._process for t in non_webhook_sources
+        ]
+        webhook_tasks = [
+            t for t in self.tasks if t.is_webhook
+        ]
 
-        if any(t.is_webhook for t in self.tasks):
+        for p in non_webhook_source_procs:
+            p.join()
+
+        if webhook_tasks:
             logger.info(
                 "Webhook(s) running. Ctrl+C to stop."
             )
@@ -629,19 +657,13 @@ class Pipeline:
                     time.sleep(1)
             except KeyboardInterrupt:
                 logger.info("Shutdown requested")
-        else:
-            logger.info(
-                "Sources finished; draining queues..."
-            )
 
-        for t in self.tasks:
-            t.wait_for_queue()
-
-        logger.info("Shutting down workers...")
+        logger.info("Shutting down...")
         for t in self.tasks:
             t.signal_stop()
-        for t in self.tasks:
-            t.stop_gracefully()
+
+        for p in procs:
+            p.join(timeout=5)
 
         logger.info("✅ Pipeline finished")
 
