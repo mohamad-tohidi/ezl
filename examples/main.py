@@ -22,7 +22,7 @@ def transform(item):
     import time
 
     time.sleep(0.01)
-    for j in range(random.randint(2, 3)):
+    for j in range(2):
         yield {
             "id": f"{item['id']}_chunk_{j}",
             "vector": [random.random() for _ in range(768)],
@@ -35,6 +35,7 @@ async def load(item):
     """Load: Async database insertion"""
     await asyncio.sleep(0.05)  # async I/O
     # await async_db.insert(item)
+    return item
 
 
 # ========================================
@@ -51,7 +52,7 @@ async def load(item):
 # if it was present, it doesnt allow the extract function to inject the data into the queue
 
 pipeline = (
-    extract >> transform >> load >> collector("logs.log")
+    extract >> transform >> load >> collector("./app.log")
 )
 
 # ========================================
@@ -61,4 +62,4 @@ pipeline = (
 if __name__ == "__main__":
     print("🚀 ETL Pipeline Starting...")
     print("=" * 50)
-    run(pipeline)  # run(pipeline, resume=True)
+    run(pipeline, resume=True)  # run(pipeline, resume=True)
