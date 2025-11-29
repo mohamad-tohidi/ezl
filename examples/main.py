@@ -1,4 +1,4 @@
-from src.ezl import task, run
+from ezl import task, run
 import random
 import asyncio
 
