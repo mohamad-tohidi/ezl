@@ -42,14 +42,6 @@ async def load(item):
 # 2. BUILD PIPELINE
 # ========================================
 
-# NOTE: by adding the collector, it will track the data that has been transfared before
-# and skip those
-# how it works?
-# it will save an item, from the incoming data, lets say the ["id"] of the incoming json (this can be configured by the user, on what to use.)
-# then, when the user restarts the pipeline, the extractor will start extracting from the first data
-# as it has no memory
-# but the collector will check, to see if the id of incoming data is present in its unique `.log` file or not
-# if it was present, it doesnt allow the extract function to inject the data into the queue
 
 pipeline = (
     extract >> transform >> load >> collector("./app.log")

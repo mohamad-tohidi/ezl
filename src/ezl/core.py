@@ -105,11 +105,12 @@ class Task:
     # worker lifecycle
     # -------------------------
     def start_workers(self):
-        if not self.upstream:
+        if self.workers == 0:
             logger.debug(
-                f"'{self.name}' has no upstream -> no workers"
+                f"'{self.name}' has workers=0 -> skipping worker startup"
             )
             return
+
         logger.info(
             f"Starting {self.workers} worker(s) for '{self.name}'"
         )
@@ -225,6 +226,26 @@ class Task:
                         else self.right
                     )
                     branch_name = branch.name
+
+                    # If branch has workers, enqueue so its workers will handle processing
+                    if branch.workers > 0:
+                        placed = False
+                        while (
+                            not placed
+                            and not self._stop.is_set()
+                        ):
+                            try:
+                                branch.input_queue.put(
+                                    item, block=False
+                                )
+                                placed = True
+                            except queue.Full:
+                                await asyncio.sleep(0.01)
+                                continue
+                        # enqueued; branch workers will process and call task_done()
+                        continue
+
+                    # branch has no workers: execute inline (handle sync/async)
                     match branch.kind:
                         case "sync_gen":
                             for out in branch.func(item):
@@ -241,18 +262,87 @@ class Task:
                                 self._send_downstream(out)
                         case "async_gen":
                             agen = branch.func(item)
-                            async for out in agen:
-                                logger.flow(
-                                    f"PROC [{self.name}:{branch_name}]"
+
+                            try:
+                                loop = asyncio.get_running_loop()
+                            except RuntimeError:
+                                loop = None
+
+                            async def _consume_agen(a):
+                                try:
+                                    async for out in a:
+                                        logger.flow(
+                                            f"PROC [{self.name}:{branch_name}]"
+                                        )
+                                        self._send_downstream(
+                                            out
+                                        )
+                                except Exception:
+                                    logger.exception(
+                                        f"Error consuming async_gen for '{branch_name}'"
+                                    )
+
+                            if loop is not None:
+                                task = loop.create_task(
+                                    _consume_agen(agen)
                                 )
-                                self._send_downstream(out)
+
+                                def _cb(t):
+                                    if t.cancelled():
+                                        return
+                                    exc = t.exception()
+                                    if exc:
+                                        logger.exception(
+                                            f"Exception in background async_gen for '{branch_name}': {exc}"
+                                        )
+
+                                task.add_done_callback(_cb)
+                            else:
+                                await _consume_agen(agen)
+
                         case "async":
-                            out = await branch.func(item)
-                            if out is not None:
-                                logger.flow(
-                                    f"PROC [{self.name}:{branch_name}]"
+                            coro = branch.func(item)
+
+                            try:
+                                loop = asyncio.get_running_loop()
+                            except RuntimeError:
+                                loop = None
+
+                            async def _await_and_forward(c):
+                                try:
+                                    out = await c
+                                    if out is not None:
+                                        logger.flow(
+                                            f"PROC [{self.name}:{branch_name}]"
+                                        )
+                                        self._send_downstream(
+                                            out
+                                        )
+                                except Exception:
+                                    logger.exception(
+                                        f"Error in async branch '{branch_name}'"
+                                    )
+
+                            if loop is not None:
+                                task = loop.create_task(
+                                    _await_and_forward(coro)
                                 )
-                                self._send_downstream(out)
+
+                                def _cb2(t):
+                                    if t.cancelled():
+                                        return
+                                    exc = t.exception()
+                                    if exc:
+                                        logger.exception(
+                                            f"Exception in background async task for '{branch_name}': {exc}"
+                                        )
+
+                                task.add_done_callback(_cb2)
+                            else:
+                                await _await_and_forward(
+                                    coro
+                                )
+
                 except Exception:
                     logger.exception(
                         f"Error in choice '{self.name}'"
@@ -264,22 +354,150 @@ class Task:
                 continue
 
     def _send_downstream(self, item: Any):
+        """
+        Send item to downstream.
+
+        Minimal change: if downstream has workers == 0, execute downstream inline
+        (so there is no unconsumed queue that will cause join() to block).
+        Otherwise preserve the original blocking put() behavior for backpressure.
+        """
         if not self.downstream:
             logger.debug(
                 f"'{self.name}' sink processed item"
             )
             return
-        logger.flow(
-            f"PUT  [{self.name}] -> [{self.downstream.name}]"
-        )
-        try:
-            # blocking put for deterministic backpressure
-            self.downstream.input_queue.put(
-                item, block=True
+
+        down = self.downstream
+
+        # If the downstream has no workers, run it inline to avoid putting
+        # items into an unconsumed queue (which causes join() to block).
+        if down.workers == 0:
+            logger.flow(
+                f"INLINE [{self.name}] -> [{down.name}]"
             )
+            try:
+                match down.kind:
+                    case "sync_gen":
+                        for out in down.func(item):
+                            logger.flow(
+                                f"PROC [{down.name}] (inline)"
+                            )
+                            if down.downstream:
+                                down._send_downstream(out)
+                    case "sync":
+                        out = down.func(item)
+                        if out is not None:
+                            logger.flow(
+                                f"PROC [{down.name}] (inline)"
+                            )
+                            if down.downstream:
+                                down._send_downstream(out)
+                    case "async_gen":
+                        agen = down.func(item)
+
+                        try:
+                            loop = (
+                                asyncio.get_running_loop()
+                            )
+                        except RuntimeError:
+                            loop = None
+
+                        async def _run_agen():
+                            try:
+                                async for out in agen:
+                                    logger.flow(
+                                        f"PROC [{down.name}] (inline)"
+                                    )
+                                    if down.downstream:
+                                        down._send_downstream(
+                                            out
+                                        )
+                            except Exception:
+                                logger.exception(
+                                    f"Error consuming async_gen for '{down.name}'"
+                                )
+
+                        if loop is not None:
+                            task = loop.create_task(
+                                _run_agen()
+                            )
+
+                            def _cb(t):
+                                if t.cancelled():
+                                    return
+                                exc = t.exception()
+                                if exc:
+                                    logger.exception(
+                                        f"Exception in inline async_gen task for '{down.name}': {exc}"
+                                    )
+
+                            task.add_done_callback(_cb)
+                        else:
+                            asyncio.run(_run_agen())
+
+                    case "async":
+                        coro = down.func(item)
+
+                        try:
+                            loop = (
+                                asyncio.get_running_loop()
+                            )
+                        except RuntimeError:
+                            loop = None
+
+                        async def _await_and_forward(c):
+                            try:
+                                out = await c
+                                if out is not None:
+                                    logger.flow(
+                                        f"PROC [{down.name}] (inline)"
+                                    )
+                                    if down.downstream:
+                                        down._send_downstream(
+                                            out
+                                        )
+                            except Exception:
+                                logger.exception(
+                                    f"Error in async downstream '{down.name}'"
+                                )
+
+                        if loop is not None:
+                            task = loop.create_task(
+                                _await_and_forward(coro)
+                            )
+
+                            def _cb2(t):
+                                if t.cancelled():
+                                    return
+                                exc = t.exception()
+                                if exc:
+                                    logger.exception(
+                                        f"Exception in inline async task for '{down.name}': {exc}"
+                                    )
+
+                            task.add_done_callback(_cb2)
+                        else:
+                            asyncio.run(
+                                _await_and_forward(coro)
+                            )
+
+                    case _:
+                        logger.error(
+                            f"Unknown downstream kind: {down.kind}"
+                        )
+            except Exception:
+                logger.exception(
+                    f"Error executing downstream '{down.name}' inline"
+                )
+            return
+
+        # Normal path: blocking put for deterministic backpressure
+        logger.flow(f"PUT  [{self.name}] -> [{down.name}]")
+        try:
+            down.input_queue.put(item, block=True)
         except Exception:
             logger.exception(
-                f"Failed to put into downstream '{self.downstream.name}'"
+                f"Failed to put into downstream '{down.name}'"
             )
 
     def wait_for_queue(self):
@@ -746,6 +964,34 @@ class Pipeline:
                     return item
 
                 self.source.func = wrapped
+
+        # ------------------------------
+        # Ensure ChoiceTask branches are part of the pipeline tasks list
+        # and wired so their workers will be started. Minimal change:
+        # For each ChoiceTask, add its left/right branches to self.tasks
+        # (if missing) and ensure branch.upstream contains the choice and
+        # branch.downstream points to choice.downstream.
+        # ------------------------------
+        extras: List[Task] = []
+        for t in list(self.tasks):
+            if isinstance(t, ChoiceTask):
+                for branch in (t.left, t.right):
+                    if (
+                        branch not in self.tasks
+                        and branch not in extras
+                    ):
+                        # wire the branch to see the choice as its upstream
+                        branch.upstream.append(t)
+                        # ensure branch forwards to the same downstream as the choice
+                        branch.downstream = t.downstream
+                        extras.append(branch)
+                    else:
+                        # ensure upstream relation exists
+                        if t not in branch.upstream:
+                            branch.upstream.append(t)
+        if extras:
+            # append extras so run() will start their workers
+            self.tasks.extend(extras)
 
         for t in self.tasks:
             t.start_workers()
